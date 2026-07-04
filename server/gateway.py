@@ -1111,7 +1111,6 @@ def main():
     SHARED_DIR = os.path.join(DATA_DIR, "shared")
     ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
     TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
-    SETUP_TOKEN = args.setup_token or None
     EMBED_DAILY_LIMIT = args.embed_daily_limit
     os.makedirs(SHARED_DIR, exist_ok=True)
 
@@ -1119,6 +1118,25 @@ def main():
 
     with LOCK:
         accounts = load_accounts()
+
+    # 초기 설정(setup) 보호 토큰 결정:
+    #  - --setup-token 으로 명시하면 그 값을 사용.
+    #  - 아니면, 아직 계정이 없을 때(초기 설정 필요) data/setup-token.txt 를 읽거나 자동 생성한다.
+    #    (터널을 거치면 모든 접속이 loopback 으로 보여 IP 기반 보호가 무력화되므로 토큰으로 보호)
+    SETUP_TOKEN = args.setup_token or None
+    if not SETUP_TOKEN and len(accounts) == 0:
+        token_file = os.path.join(DATA_DIR, "setup-token.txt")
+        try:
+            if os.path.exists(token_file):
+                with open(token_file, encoding="utf-8") as f:
+                    SETUP_TOKEN = f.read().strip() or None
+            if not SETUP_TOKEN:
+                SETUP_TOKEN = secrets.token_hex(16)
+                with open(token_file, "w", encoding="utf-8") as f:
+                    f.write(SETUP_TOKEN + "\n")
+        except OSError as e:
+            print(f"  [경고] 초기 설정 토큰 파일을 다루지 못했습니다: {e}", flush=True)
+
     ollama_ok = ollama_alive()
     print_banner(args.port, len(accounts), ollama_ok)
 
