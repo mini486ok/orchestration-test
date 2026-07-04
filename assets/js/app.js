@@ -184,9 +184,34 @@ router.register('/evaluation/:runId', renderEvaluation);
 router.register('/settings', renderSettings);
 router.register('/guide', renderGuide);
 
+/* ---------- URL 파라미터로 Ollama 서버 주소 자동 설정 ----------
+   예: https://.../orchestration-test/?ollama=https://xxx.trycloudflare.com
+   서버 운영자가 터널 주소가 포함된 링크 하나를 공유하면 각 클라이언트 설정이 자동 구성된다. */
+let urlParamApplied = null;
+function applyUrlParams() {
+  const p = new URLSearchParams(location.search);
+  const o = p.get('ollama');
+  if (!o) return;
+  try {
+    const u = new URL(o);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('scheme');
+    const url = (u.origin + u.pathname).replace(/\/+$/, '');
+    store.update('settings', s => ({ ...(s && typeof s === 'object' ? s : {}), ollamaUrl: url }));
+    urlParamApplied = url;
+    history.replaceState(null, '', location.pathname + location.hash);
+  } catch {
+    toast('링크의 ollama 주소가 올바르지 않아 무시했습니다.', 'warn');
+    history.replaceState(null, '', location.pathname + location.hash);
+  }
+}
+
 /* ---------- 부트 ---------- */
 function boot() {
   seed();
+  if (urlParamApplied === null && location.search.includes('ollama=')) {
+    applyUrlParams();
+    if (urlParamApplied) toast(`링크의 LLM 서버 주소로 설정되었습니다: ${urlParamApplied}`, 'success', 6000);
+  }
   if (!auth.hasAccounts()) {
     teardownShell();
     renderSetup(app, () => boot());

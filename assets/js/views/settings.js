@@ -70,9 +70,9 @@ export async function render(container) {
     el('div', { class: 'panel-title' }, 'Ollama LLM 연결'),
     field({
       label: 'Ollama 서버 주소', input: urlInput,
-      hint: '기본값 http://localhost:11434 — 이 컴퓨터에 설치된 Ollama를 사용합니다. GitHub Pages에서 접속하는 경우 OLLAMA_ORIGINS 설정이 필요합니다(가이드 참조).',
+      hint: '기본값 http://localhost:11434 (이 컴퓨터의 Ollama). 다른 PC의 Ollama를 쓰려면 그 서버의 터널 주소(예: https://xxx.trycloudflare.com) 또는 LAN 주소(예: http://192.168.0.10:11434)를 입력하세요 — 가이드의 "다른 PC에서 사용하기" 참조.',
     }),
-    el('div', { class: 'row', style: { marginBottom: '14px' } },
+    el('div', { class: 'row wrap', style: { marginBottom: '14px' } },
       el('button', {
         class: 'btn', onclick: () => {
           const raw = urlInput.value.trim();
@@ -89,6 +89,19 @@ export async function render(container) {
           testConn();
         },
       }, '저장 후 연결 테스트'),
+      el('button', {
+        class: 'btn btn-ghost', title: '현재 서버 주소가 자동 설정되는 접속 링크를 복사합니다 — 다른 PC 사용자에게 이 링크만 공유하면 됩니다.',
+        onclick: async () => {
+          const cur = (store.get('settings') || {}).ollamaUrl || urlInput.value.trim();
+          const link = location.origin + location.pathname + '?ollama=' + encodeURIComponent(cur);
+          try {
+            await navigator.clipboard.writeText(link);
+            toast('공유 링크가 복사되었습니다. 다른 PC에서 이 링크로 접속하면 LLM 서버 주소가 자동 설정됩니다.', 'success', 6000);
+          } catch {
+            toast('클립보드 복사에 실패했습니다: ' + link, 'warn', 8000);
+          }
+        },
+      }, '🔗 공유 링크 복사'),
       connState),
     field({ label: '기본 LLM 모델', input: modelSelect, hint: modelState.textContent }),
     modelState,

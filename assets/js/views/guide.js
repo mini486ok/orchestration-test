@@ -53,6 +53,35 @@ python -m http.server 8000
       </ul>`,
   },
   {
+    title: '🌐 다른 PC에서 이 서버의 LLM 사용하기',
+    html: `
+      <p>서버 PC(Ollama가 설치된 PC) 한 대를 팀이 함께 쓸 수 있습니다. <b>방법 A(터널)를 권장</b>합니다 —
+      https 주소라 브라우저 제약(mixed content, 로컬 네트워크 권한)이 전혀 없고, 같은 네트워크가 아니어도 동작합니다.</p>
+
+      <p><b>방법 A. Cloudflare Tunnel (권장)</b></p>
+      <ol>
+        <li><b>서버 PC:</b> <a href="https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" target="_blank" rel="noopener">cloudflared</a> 설치 후 실행:
+          <pre><code>cloudflared tunnel --url http://localhost:11434 --no-autoupdate</code></pre>
+          출력에 표시되는 <code>https://xxxx.trycloudflare.com</code> 주소가 LLM 서버 주소입니다.
+          (repo의 <code>tools/start-ollama-tunnel.bat</code> 더블클릭으로도 실행 가능)</li>
+        <li><b>서버 PC:</b> Ollama가 이 웹앱 출처를 허용해야 합니다 — <code>OLLAMA_ORIGINS</code>에 <code>https://mini486ok.github.io</code> 설정 후 Ollama 재시작.</li>
+        <li><b>클라이언트 PC:</b> 설정 → Ollama 서버 주소에 터널 주소를 입력하거나, 서버 운영자가 설정 화면의
+          <b>"🔗 공유 링크 복사"</b>로 만든 링크(<code>…/?ollama=터널주소</code>)로 접속하면 <b>자동 설정</b>됩니다.</li>
+      </ol>
+      <p class="hint">⚠ Quick Tunnel 주소는 터널을 재시작할 때마다 바뀝니다. 고정 주소가 필요하면 Cloudflare 계정+도메인으로
+      Named Tunnel을 만드세요. 또한 터널 주소를 아는 사람은 누구나 LLM을 호출할 수 있으니(별도 인증 없음) 주소 공유에 유의하세요.</p>
+
+      <p><b>방법 B. 같은 네트워크(LAN) 직접 연결</b></p>
+      <ol>
+        <li><b>서버 PC:</b> <code>OLLAMA_HOST=0.0.0.0:11434</code> 환경변수 설정 + Ollama 재시작, 방화벽 인바운드 허용(관리자 PowerShell):
+          <pre><code>netsh advfirewall firewall add rule name="Ollama 11434" dir=in action=allow protocol=TCP localport=11434 profile=private,domain</code></pre></li>
+        <li><b>클라이언트 PC:</b> 설정에서 주소를 <code>http://서버IP:11434</code>로 변경. Chrome/Edge에서
+          "로컬 네트워크 액세스" 권한 프롬프트가 뜨면 허용합니다.</li>
+      </ol>
+      <p class="hint">방법 B는 https 페이지에서 http 사설 IP를 호출하므로 브라우저·정책에 따라 차단될 수 있습니다(Chrome/Edge 최신 버전 필요).
+      문제가 있으면 방법 A를 사용하세요. LAN 개방 시 같은 네트워크의 누구나 Ollama를 호출할 수 있다는 점도 유의하세요.</p>`,
+  },
+  {
     title: '🧠 오케스트레이션 전략 3가지',
     html: `
       <ul>

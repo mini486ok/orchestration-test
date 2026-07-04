@@ -16,6 +16,34 @@ export function getNumCtx() {
   return Number(s.numCtx) > 0 ? Number(s.numCtx) : 16384;
 }
 
+/**
+ * 로컬/사설망 대상 fetch 래퍼 — https 공개 페이지에서 사설 IP·localhost로 요청할 때
+ * Chrome의 Local Network Access를 위해 targetAddressSpace 값을 순차 시도한다.
+ * (버전에 따라 'local'/'private'/'loopback' 명칭이 다르므로 실패 시 재시도. 옵션 미지원 브라우저는 무시됨)
+ */
+async function fetchLNA(url, init = {}) {
+  const attempts = [init];
+  try {
+    if (location.protocol === 'https:' && !/^(localhost|127\.)/.test(location.hostname)) {
+      const h = new URL(url, location.href).hostname;
+      let spaces = [];
+      if (/^(localhost|127\.|\[::1\])/.test(h)) spaces = ['loopback', 'local'];
+      else if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) spaces = ['local', 'private'];
+      for (const s of spaces) attempts.push({ ...init, targetAddressSpace: s });
+    }
+  } catch { /* URL 파싱 실패 시 기본 시도만 */ }
+
+  let lastErr;
+  for (const opt of attempts) {
+    try { return await fetch(url, opt); }
+    catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
 /** https 공개 페이지에서 로컬 주소로 접근하는 상황인지 (Chrome 로컬 네트워크 액세스 권한 필요 가능) */
 export function isPublicToLocal() {
   try {
@@ -38,7 +66,7 @@ export async function checkConnection(timeoutMs = 4000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(getOllamaUrl() + '/api/version', { signal: ctrl.signal });
+    const res = await fetchLNA(getOllamaUrl() + '/api/version', { signal: ctrl.signal });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
     const data = await res.json();
     return { ok: true, version: data.version };
@@ -52,7 +80,7 @@ export async function checkConnection(timeoutMs = 4000) {
 
 /** 설치된 모델 목록: [{name, sizeGB, family, paramSize}] */
 export async function listModels() {
-  const res = await fetch(getOllamaUrl() + '/api/tags');
+  const res = await fetchLNA(getOllamaUrl() + '/api/tags');
   if (!res.ok) throw new Error(`모델 목록 조회 실패 (HTTP ${res.status})`);
   const data = await res.json();
   return (data.models || [])
@@ -84,7 +112,7 @@ export async function chat({ model, messages, temperature = 0.2, format, signal 
 
   let res;
   try {
-    res = await fetch(getOllamaUrl() + '/api/chat', {
+    res = await fetchLNA(getOllamaUrl() + '/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
