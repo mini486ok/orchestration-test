@@ -916,3 +916,80 @@ body:has(.drawer) #toast-root { right: min(580px, 96vw); }
 .idx-prog-track { height: 6px; background: var(--bg2); border-radius: 3px; overflow: hidden; }
 .idx-prog-fill { height: 100%; width: 0; background: var(--sig-green); border-radius: 3px; transition: width .18s var(--ease); }
 .idx-prog-text { font-family: var(--font-mono); font-size: 11px; color: var(--tx2); margin-top: 5px; }
+
+/* --- DB 전략 (graph) --- */
+.db-editor .seg button { font-size: 12.5px; }
+
+/* 엣지 설정 카드 */
+.edge-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 760px) { .edge-cards { grid-template-columns: 1fr; } }
+.edge-card {
+  background: var(--bg0); border: 1px solid var(--line-soft); border-radius: var(--r2);
+  padding: 10px 12px; transition: opacity .15s var(--ease), border-color .15s;
+}
+.edge-card.off { opacity: .5; }
+.edge-card .ec-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.edge-card .ec-on { height: auto; gap: 7px; font-weight: 600; }
+.edge-card .ec-on input[type=checkbox] { accent-color: var(--sig-green); width: 15px; height: 15px; flex-shrink: 0; }
+.edge-card .ec-title { font-size: 12.5px; font-family: var(--font-mono); }
+.edge-card .ec-ctrl { display: flex; align-items: center; gap: 7px; }
+.edge-card .ec-ctrl input[type=range] { width: 92px; }
+.edge-card .ec-lbl { font-size: 11px; color: var(--tx2); white-space: nowrap; }
+.edge-card .ec-desc { margin-top: 6px; line-height: 1.5; }
+
+/* 그래프 상태 카드 — 유형별 엣지 수 */
+.graph-edge-counts { display: flex; flex-wrap: wrap; gap: 6px 12px; font-family: var(--font-mono); font-size: 11px; color: var(--tx2); }
+.graph-edge-counts .gec { display: inline-flex; align-items: center; gap: 5px; }
+.graph-edge-counts .gec-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+
+/* 그래프 시각화 */
+.graph-viz-wrap {
+  background: radial-gradient(circle at 50% 38%, rgba(26,38,55,.55), var(--bg0));
+  border: 1px solid var(--line-soft); border-radius: var(--r2); overflow: hidden;
+}
+.graph-svg { display: block; width: 100%; height: auto; cursor: grab; touch-action: none; }
+.graph-svg:active { cursor: grabbing; }
+.graph-svg .gv-node:hover circle { stroke: var(--sig-green) !important; stroke-width: 2.4 !important; stroke-opacity: 1 !important; }
+.graph-empty {
+  background: var(--bg0); border: 1px dashed var(--line); border-radius: var(--r2);
+  padding: 26px 16px; text-align: center; color: var(--tx2); font-size: 12.5px; line-height: 1.6;
+}
+.graph-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 8px; font-size: 11.5px; color: var(--tx2); }
+.graph-legend .gl-title { color: var(--tx2b); font-weight: 600; letter-spacing: .03em; }
+.graph-legend .gl-item { display: inline-flex; align-items: center; gap: 6px; }
+.graph-legend .gl-line { width: 16px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+.graph-legend .gl-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+/* 검색 미리보기 · 경로 추천 */
+.graph-preview .gr-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.gr-row { display: flex; align-items: center; gap: 10px; padding: 5px 9px; background: var(--bg0); border: 1px solid var(--line-soft); border-radius: var(--r1); }
+.gr-row .gr-name { flex: 1; min-width: 0; font-size: 12.5px; color: var(--tx1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gr-row .gr-name small { color: var(--tx2); font-family: var(--font-mono); }
+.gr-row .gr-score { font-size: 11.5px; color: var(--tx2); min-width: 46px; text-align: right; }
+.graph-paths .gr-path { background: var(--bg0); border: 1px solid var(--line-soft); border-radius: var(--r2); padding: 9px 11px; margin-top: 6px; }
+.graph-paths .gr-path-no { font-family: var(--font-mono); font-size: 12px; color: var(--sig-blue); font-weight: 600; }
+.graph-paths .gr-path .wf-line { margin-top: 6px; }
+
+/* llm(무거움) 엣지 카드 강조 + 경고 문구 + 모델 드롭다운 */
+.edge-card.heavy { border-color: rgba(62,207,207,.4); }
+.edge-card.leak { border-color: rgba(244,182,63,.4); }   /* cooccur 정보 누출 경고(U9) */
+.edge-card .ec-warn { color: var(--sig-amber); }
+.model-picker .select, .model-picker .input { width: 100%; }
+
+/* 그래프 시각화 표시 옵션 컨트롤 바 + 팬/줌 + 확대 모달 (U2·U5) */
+.graph-viz-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 8px; }
+.graph-viz-controls .gvc-seg .seg button { font-size: 11.5px; padding: 4px 10px; }
+.graph-viz-controls .gvc-chk { font-size: 12px; color: var(--tx1); }
+.graph-viz-controls .gvc-chk input[type=checkbox] { accent-color: var(--sig-green); width: 15px; height: 15px; flex-shrink: 0; }
+.graph-legend .gl-swatch { flex-shrink: 0; overflow: visible; }
+.gv-pan { transition: transform .04s linear; }
+
+/* 확대 모달 — 넓은 캔버스, 자유 줌/팬 */
+.graph-modal { display: flex; flex-direction: column; gap: 8px; }
+.graph-modal-host .graph-viz-wrap { min-height: 60vh; }
+.graph-modal-host .graph-svg { max-height: 72vh; }
+/* 모바일: 세로 비율 캔버스가 화면을 채우도록 여유 확대(레터박스 축소, U3) */
+@media (max-width: 480px) {
+  .graph-modal-host .graph-viz-wrap { min-height: 66vh; }
+  .graph-modal-host .graph-svg { max-height: 78vh; }
+}

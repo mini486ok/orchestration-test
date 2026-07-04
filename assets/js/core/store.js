@@ -163,7 +163,8 @@ export const store = {
 
   /** 앱 데이터 전체 삭제 (계정 포함 여부 선택) */
   reset({ keepAccounts = true } = {}) {
-    const keys = ['settings', 'mcps', 'strategies', 'benchmarks', 'runs', 'session'];
+    // catalogIndex(벡터 인덱스)·catalogGraph(그래프 db)도 함께 정리(용량 잔존 방지)
+    const keys = ['settings', 'mcps', 'strategies', 'benchmarks', 'runs', 'session', 'catalogIndex', 'catalogGraph'];
     if (!keepAccounts) keys.push('accounts');
     for (const k of keys) {
       cache.delete(k);

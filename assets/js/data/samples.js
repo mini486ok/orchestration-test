@@ -8,7 +8,8 @@
 //  2) sample-strategy-2  prompt(react)  ReAct 탐색형
 //  3) sample-strategy-3  skill          여객 안내 스킬셋 (스킬 3종)
 //  4) sample-strategy-4  rule           키워드 라우팅 룰셋 (룰 5종)
-//  5) sample-strategy-5  prompt(plan)   검색증강 플래너 (RAG · catalogMode=retrieval)
+//  5) sample-strategy-5  db(vector·plan) 벡터 DB 플래너 (임베딩 인덱스 검색 공급)
+//  6) sample-strategy-6  db(graph·plan)  그래프 DB 플래너 (도구 관계 그래프 순회 공급)
 //
 // [벤치마크]
 //  sample-benchmark-basic  기본 검증 세트 (항목 10개, easy 4 / medium 4 / hard 2)
@@ -281,25 +282,25 @@ export const SAMPLE_STRATEGIES = [
   },
 
   // --------------------------------------------------------------------------
-  // 5. 프롬프트 기반 — 검색증강 플래너 (RAG · catalogMode='retrieval')
-  //    전략1과 동일한 시스템 프롬프트를 사용하되, 전체 카탈로그 대신 질의와 관련된
-  //    도구만 검색(하이브리드)으로 공급해 컨텍스트를 절약한다.
-  //    ※ 실행 전, 오케스트레이션 화면의 "도구 카탈로그 공급" 섹션에서 인덱스를 먼저 구축해야 한다.
+  // 5. DB 기반(vector) — 벡터 DB 플래너
+  //    카탈로그를 임베딩 벡터 db(catalogIndex)로 구축하고, 질의와 의미적으로 가까운 도구만
+  //    검색(하이브리드)해 플래너에 공급한다. systemPrompt는 전략1(기본 플래너)과 동일.
+  //    ※ 실행 전, DB 전략 편집기의 인덱스 상태 카드에서 벡터 인덱스를 먼저 구축해야 한다.
   // --------------------------------------------------------------------------
   {
     id: 'sample-strategy-5',
-    name: '검색증강 플래너 (RAG)',
-    description: '기본 플래너와 동일한 프롬프트를 쓰되, 모든 도구를 나열하는 대신 질의와 관련된 도구만 검색(하이브리드)으로 골라 공급해 프롬프트 컨텍스트를 절약하는 플래너. 도구가 많아질수록 토큰 효율과 계획 정확도 이점이 커진다. ⚠ 실행 전 오케스트레이션 화면의 "도구 카탈로그 공급" 섹션에서 카탈로그 인덱스를 먼저 구축해야 한다(미구축 시 키워드 검색으로 폴백).',
-    type: 'prompt',
+    name: '벡터 DB 플래너',
+    description: '카탈로그를 임베딩 벡터 db로 구축하고, 전체 도구를 나열하는 대신 질의와 의미적으로 가까운 도구만 하이브리드 검색으로 골라 공급하는 플래너. 도구가 많아질수록 토큰 효율과 계획 정확도 이점이 커진다. ⚠ 실행 전 DB 전략 편집기의 인덱스 상태 카드에서 벡터 인덱스를 먼저 구축해야 한다(미구축 시 키워드 검색으로 폴백).',
+    type: 'db',
     model: null,
     createdAt: '2026-07-04T00:00:00Z',
     updatedAt: '2026-07-04T00:00:00Z',
     config: {
+      store: 'vector',
       planningMode: 'plan',
       temperature: 0.1,
       maxSteps: 6,
-      catalogMode: 'retrieval',
-      retrieval: {
+      vector: {
         method: 'hybrid',
         topK: 8,
         threshold: 0,
@@ -307,6 +308,79 @@ export const SAMPLE_STRATEGIES = [
         expandServer: true,
         expandCategory: false,
         embedModel: 'bge-m3:latest'
+      },
+      systemPrompt: [
+        '당신은 철도·교통 분야의 MCP 오케스트레이터입니다. 사용자 질의를 해결하기 위해 사용 가능한 MCP 도구들을 조합하여 하나의 실행 계획(plan)을 세웁니다.',
+        '',
+        '[오늘 날짜]',
+        '{{DATE}}',
+        '',
+        '[사용 가능한 도구 목록]',
+        '{{TOOL_CATALOG}}',
+        '',
+        '[계획 수립 지침]',
+        '- 질의 해결에 실제로 필요한 도구만 선택하고, 논리적 실행 순서대로 배열하세요.',
+        '- 각 도구의 params 에는 그 도구의 입력 스키마에 존재하는 키만 사용합니다.',
+        '- 각 단계의 params는 질의에서 직접 추출해 채우세요. 앞 단계 출력값이 필요하면 {{step1.output.필드}} 형식으로 참조할 수 있습니다.',
+        '- "내일", "이번 주말" 같은 상대 날짜는 {{DATE}} 를 기준으로 YYYY-MM-DD 형식으로 변환하세요.',
+        '- 불필요한 도구를 남발하지 말고 최소한의 단계로 해결하세요. 해결 불가한 질의면 plan 을 빈 배열로 두고 reasoning 에 이유를 적습니다.',
+        '',
+        '[응답 형식]',
+        '{"plan":[{"server":"서버id","tool":"도구명","params":{"키":"값"}}],"reasoning":"선택 근거를 한 문장으로"}',
+        '',
+        '[예시]',
+        '질의: "내일 아침 서울에서 부산 가는 KTX 알려줘"',
+        '출력: {"plan":[{"server":"kr-train-schedule","tool":"search_trains","params":{"from":"서울","to":"부산","trainType":"KTX"}}],"reasoning":"출발·도착역과 열차종별로 편성을 검색하면 되므로 단일 도구로 충분함"}',
+        '질의: "모레 서울에서 동대구 가는 KTX 예매하려는데 자리 있는지 봐줘"',
+        '출력: {"plan":[{"server":"kr-train-schedule","tool":"search_trains","params":{"from":"서울","to":"동대구","trainType":"KTX"}},{"server":"rail-reservation","tool":"check_seat_availability","params":{"trainNo":"{{step1.output.trains.0.trainNo}}","date":"{{DATE}}"}}],"reasoning":"편성을 먼저 검색하고 첫 열차 번호로 잔여석을 확인하는 2단계 흐름"}',
+        '',
+        '[사용자 질의]',
+        '{{QUERY}}',
+        '',
+        '반드시 위 [응답 형식]의 순수 JSON 한 덩어리만 출력하세요. 설명 문장·마크다운·코드펜스 없이 JSON만 출력합니다.'
+      ].join('\n')
+    }
+  },
+
+  // --------------------------------------------------------------------------
+  // 6. DB 기반(graph) — 그래프 DB 플래너
+  //    도구=노드, 도구 간 관계(io/semantic/server/category/cooccur/llm)=엣지 그래프를 구축하고,
+  //    질의 시드에서 그래프를 순회(hops 확산)해 연관 도구를 함께 공급한다. systemPrompt는 전략1과 동일.
+  //    기본값: io on / semantic on / server on(0.5) / category off / cooccur off(벤치마크 정보 누출 방지) / llm off(무거움),
+  //    hops 2 · seedK 5 · decay 0.5 · topK 8. 모델은 embedModel·extractModel 모두 null(=기본값 사용).
+  //    ※ 실행 전, DB 전략 편집기의 그래프 db 상태 카드에서 그래프를 먼저 구축해야 한다
+  //      (미구축·stale 시 vector/키워드 검색으로 폴백). semantic 엣지는 벡터 인덱스가 있을 때만,
+  //      llm 엣지는 편집기에서 llm을 켜고 구축할 때만(도구당 1회 LLM 호출) 포함된다.
+  // --------------------------------------------------------------------------
+  {
+    id: 'sample-strategy-6',
+    name: '그래프 DB 플래너',
+    description: '카탈로그를 도구 관계 그래프(입출력 연결·의미 유사·서버·카테고리·공출현 엣지, 그리고 선택적으로 LLM 의미 관계(llm 엣지, 기본 off))로 구축하고, 질의 시드에서 그래프를 순회해 직접 매치된 도구뿐 아니라 함께 쓰이는 연관 도구까지 묶어 공급하는 플래너. 다단계 워크플로우에서 이어지는 도구를 놓치지 않는 이점이 있다. ⚠ 실행 전 DB 전략 편집기의 그래프 db 상태 카드에서 그래프를 먼저 구축해야 한다(미구축·stale 시 vector/키워드 검색으로 폴백). llm 엣지를 켜면 구축 시 도구당 1회 LLM 호출로 의미 관계를 추출한다.',
+    type: 'db',
+    model: null,
+    createdAt: '2026-07-04T00:00:00Z',
+    updatedAt: '2026-07-04T00:00:00Z',
+    config: {
+      store: 'graph',
+      planningMode: 'plan',
+      temperature: 0.1,
+      maxSteps: 6,
+      graph: {
+        edges: {
+          io: { on: true, weight: 1.0, threshold: 0.0 },
+          semantic: { on: true, weight: 1.0, threshold: 0.55 },
+          server: { on: true, weight: 0.5 },
+          category: { on: false, weight: 0.3 },
+          cooccur: { on: false, weight: 1.0, threshold: 1 },
+          llm: { on: false, weight: 1.0, threshold: 1 }
+        },
+        seedMethod: 'hybrid',
+        seedK: 5,
+        hops: 2,
+        decay: 0.5,
+        topK: 8,
+        embedModel: null,
+        extractModel: null
       },
       systemPrompt: [
         '당신은 철도·교통 분야의 MCP 오케스트레이터입니다. 사용자 질의를 해결하기 위해 사용 가능한 MCP 도구들을 조합하여 하나의 실행 계획(plan)을 세웁니다.',

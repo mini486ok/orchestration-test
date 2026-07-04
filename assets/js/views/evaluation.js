@@ -10,8 +10,8 @@ import { runEvaluation } from '../services/evaluator.js';
 import { checkConnection, listModels } from '../services/ollama.js';
 
 /* ---------- 공통 헬퍼 ---------- */
-const TYPE_LABEL = { prompt: '프롬프트', skill: '스킬', rule: '룰' };
-const TYPE_KIND = { prompt: 'violet', skill: 'blue', rule: 'amber' };
+const TYPE_LABEL = { prompt: '프롬프트', skill: '스킬', rule: '룰', db: 'DB' };
+const TYPE_KIND = { prompt: 'violet', skill: 'blue', rule: 'amber', db: 'green' };
 const DIFF_LABEL = { easy: '쉬움', medium: '보통', hard: '어려움' };
 const DIFF_KIND = { easy: 'green', medium: 'amber', hard: 'red' };
 const STATUS_LABEL = { running: '실행 중', done: '완료', cancelled: '중단됨', error: '오류' };
@@ -29,10 +29,10 @@ const SORT_OPTS = [
 
 function typeBadge(type) { return badge(TYPE_LABEL[type] || type || '?', TYPE_KIND[type] || 'dim'); }
 
-/** LLM을 사용하는 전략인지 */
+/** LLM을 사용하는 전략인지 (db 전략도 검색 후 plan/react 플래너로 LLM 호출) */
 function usesLLM(s) {
   if (!s) return false;
-  if (s.type === 'prompt' || s.type === 'skill') return true;
+  if (s.type === 'prompt' || s.type === 'skill' || s.type === 'db') return true;
   if (s.type === 'rule') return s.config?.onNoMatch === 'llmFallback';
   return false;
 }

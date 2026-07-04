@@ -15,6 +15,7 @@ import { render as renderDashboard } from './views/dashboard.js';
 import { render as renderMcps } from './views/mcps.js';
 import { render as renderMcpBuilder } from './views/mcpBuilder.js';
 import { render as renderOrchestration } from './views/orchestration.js';
+import { render as renderPlayground } from './views/playground.js';
 import { render as renderBenchmarks } from './views/benchmarks.js';
 import { render as renderEvaluation } from './views/evaluation.js';
 import { render as renderSettings } from './views/settings.js';
@@ -60,6 +61,7 @@ const NAV = [
   { path: '/dashboard', icon: '🎛️', label: '대시보드' },
   { path: '/mcps', icon: '🧩', label: 'MCP 카탈로그' },
   { path: '/orchestration', icon: '🧠', label: '오케스트레이션' },
+  { path: '/playground', icon: '⚡', label: '실시간 테스트' },
   { path: '/benchmarks', icon: '📏', label: '벤치마크' },
   { path: '/evaluation', icon: '🏁', label: '평가·비교' },
   { section: 'SYSTEM' },
@@ -72,6 +74,7 @@ const TITLES = {
   '/mcps': 'MCP 카탈로그',
   '/mcps/new': 'MCP 빌더',
   '/orchestration': '오케스트레이션 스튜디오',
+  '/playground': '실시간 테스트',
   '/benchmarks': '벤치마크 랩',
   '/evaluation': '평가 · 비교',
   '/settings': '설정',
@@ -230,6 +233,7 @@ router.register('/mcps/new', renderMcpBuilder);
 router.register('/mcps/edit/:id', renderMcpBuilder);
 router.register('/orchestration', renderOrchestration);
 router.register('/orchestration/:id', renderOrchestration);
+router.register('/playground', renderPlayground);
 router.register('/benchmarks', renderBenchmarks);
 router.register('/benchmarks/:id', renderBenchmarks);
 router.register('/evaluation', renderEvaluation);

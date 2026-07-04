@@ -4,6 +4,8 @@
 import { chatJSON, getDefaultModel, getNumCtx } from './ollama.js';
 import { executeTool, validateParams } from './mockEngine.js';
 import { retrieve } from './catalogIndex.js';
+import { store } from '../core/store.js';
+import { graphRetrieve, graphStatus, GRAPH_KEY } from './catalogGraph.js';
 
 /* ============================================================
    기본 프롬프트
@@ -144,7 +146,8 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
   const byId = new Map((mcps || []).map(m => [m.id, m]));
   const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false };
   // react는 도구 오류를 관찰(observation)로 흘려보내 모델이 회복하도록 두므로 step 오류만으로 실패 처리하지 않는다.
-  const failOnStepError = !(strategy?.type === 'prompt' && cfg.planningMode === 'react');
+  // prompt·db 모두 planningMode==='react'면 동일하게 처리(db도 프롬프트 실행 경로를 공유).
+  const failOnStepError = !((strategy?.type === 'prompt' || strategy?.type === 'db') && cfg.planningMode === 'react');
 
   const emit = (type, label, detail) => {
     const ev = { ts: Date.now(), type, label: String(label) };
@@ -370,12 +373,17 @@ function reduceMcps(mcps, results) {
 }
 
 /**
- * catalogMode==='retrieval'일 때 ctx.catalog를 축소 카탈로그로 교체.
+ * 벡터/키워드 검색으로 ctx.catalog를 축소 카탈로그로 교체.
+ * - 하위호환 prompt(catalogMode='retrieval')은 config.retrieval을,
+ *   db(store='vector')은 config.vector를 파라미터로 넘긴다(opts.params).
  * 임베딩(vector/hybrid)은 LLM 호출로 세지 않는다 — llmCalls 미증가, totalLatencyMs만 반영.
+ * @param {object} ctx 실행 컨텍스트
+ * @param {{params?:object, label?:string}} [opts] params 미지정 시 config.retrieval 사용, label은 trace 접두어
  */
-async function applyCatalogRetrieval(ctx) {
+async function applyCatalogRetrieval(ctx, opts = {}) {
   const cfg = ctx.strategy.config || {};
-  const r = cfg.retrieval || {};
+  const r = opts.params || cfg.retrieval || {};
+  const label = opts.label || '카탈로그 검색';
   const method = r.method || 'hybrid';
   const topK = Number(r.topK) > 0 ? Math.floor(Number(r.topK)) : 8;
 
@@ -396,14 +404,14 @@ async function applyCatalogRetrieval(ctx) {
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
     ctx.result.totalLatencyMs += performance.now() - t0; // 임베딩 시도 지연도 총 지연에 포함
-    ctx.emit('error', `카탈로그 검색 실패 — 전체 카탈로그로 폴백: ${e.message}`);
+    ctx.emit('error', `${label} 실패 — 전체 카탈로그로 폴백: ${e.message}`);
     return;
   }
   ctx.result.totalLatencyMs += performance.now() - t0;
 
   const results = res.results || [];
   if (!results.length) {
-    ctx.emit('info', `⚠ 카탈로그 검색 결과 0개 — 전체 카탈로그로 폴백합니다 (${res.usedMethod}${res.fallbackReason ? ', ' + res.fallbackReason : ''}).`);
+    ctx.emit('info', `⚠ ${label} 결과 0개 — 전체 카탈로그로 폴백합니다 (${res.usedMethod}${res.fallbackReason ? ', ' + res.fallbackReason : ''}).`);
     return;
   }
 
@@ -424,7 +432,118 @@ async function applyCatalogRetrieval(ctx) {
     })),
   };
   ctx.emit('info',
-    `카탈로그 검색: ${results.length}개 도구 선택 (${res.usedMethod}, topK=${topK})${res.fallbackReason ? ' · 폴백: ' + res.fallbackReason : ''}`,
+    `${label}: ${results.length}개 도구 선택 (${res.usedMethod}, topK=${topK})${res.fallbackReason ? ' · 폴백: ' + res.fallbackReason : ''}`,
+    detail);
+}
+
+/**
+ * 그래프 db 검색으로 ctx.catalog를 축소 카탈로그로 교체(db, store='graph').
+ * 그래프 없음/stale이면 vector(keyword) 검색으로 폴백 + 경고 trace.
+ * 검색 임베딩(시드·semantic)은 llmCalls 미증가, totalLatencyMs만 반영.
+ */
+async function applyGraphRetrieval(ctx) {
+  const cfg = ctx.strategy.config || {};
+  const g = cfg.graph || {};
+  const embedModel = g.embedModel || 'bge-m3:latest';
+  // 추출 모델은 config가 null이면 기본 모델. graphStatus에 넘겨 llm 엣지 사용 그래프의 모델 변경도 stale 판정.
+  const extractModel = g.extractModel || getDefaultModel();
+  const benchmarks = store.get('benchmarks') || [];
+  // G3: 현재 전략이 켠 엣지(semantic/llm) 기준으로 재구축 필요 여부까지 받는다.
+  const status = graphStatus(ctx.allMcps, benchmarks, embedModel, extractModel, {
+    wantSemantic: !!g.edges?.semantic?.on,
+    wantLlm: !!g.edges?.llm?.on,
+  });
+
+  // 그래프 손상/실패 시 재사용하는 vector(→keyword) 폴백 — 전체 카탈로그가 아니라 축소 검색으로 폴백(E4).
+  const graphVectorFallback = (label) => applyCatalogRetrieval(ctx, {
+    params: {
+      method: g.seedMethod || 'hybrid',
+      topK: Number(g.topK) > 0 ? Math.floor(Number(g.topK)) : 8,
+      threshold: 0,
+      expandServer: true,
+      expandCategory: false,
+      embedModel,
+    },
+    label,
+  });
+
+  // 그래프 없음/stale → vector(또는 keyword) 폴백
+  if (!status.exists || status.stale) {
+    const why = !status.exists ? '그래프 db가 아직 구축되지 않음' : '그래프 db가 stale(MCP·벤치마크 변경됨)';
+    ctx.emit('info', `⚠ ${why} — vector 검색으로 폴백합니다. 그래프 편집기에서 그래프를 구축/재구축하세요.`);
+    await graphVectorFallback('DB 검색(graph→vector 폴백)');
+    return;
+  }
+
+  // G3: 그래프는 존재·최신이지만 켠 엣지(semantic/llm)가 아직 반영 안 됐거나 인덱스가 stale이면
+  // 폴백까진 아니어도 경고로 알린다(사용자가 재구축 필요를 인지하도록). needsRebuild 사유를 그대로 노출.
+  if (status.needsRebuild && status.rebuildReasons?.length) {
+    ctx.emit('info', `⚠ 그래프 재구축 필요 — ${status.rebuildReasons.join(' / ')} (해당 엣지가 반영되지 않은 채 기존 그래프로 검색합니다)`);
+  }
+
+  // LLM 엣지를 켰는데 그래프에 llm 엣지가 0개면 사실을 명시(E5): 추출 실패(전부/일부) vs 개념 교차 없음 구분.
+  if (g.edges?.llm?.on && status.usedLlm && (status.edgeCountByType?.llm || 0) === 0) {
+    const failed = status.llmFailed || 0;
+    if (failed >= status.nodeCount && status.nodeCount > 0) {
+      ctx.emit('info', `⚠ LLM 엣지 0개 — 추출이 전부 실패했습니다(${failed}/${status.nodeCount} 도구). 추출 모델·Ollama 연결을 확인하고 재구축하세요.`);
+    } else if (failed > 0) {
+      ctx.emit('info', `⚠ LLM 엣지 0개 — 일부 도구 추출 실패(${failed}/${status.nodeCount}) 및 개념 교차 없음.`);
+    } else {
+      ctx.emit('info', 'ℹ LLM 엣지 0개 — 추출은 됐으나 도구 간 개념 교차가 없어 생성된 llm 엣지가 없습니다.');
+    }
+  }
+
+  const graph = store.get(GRAPH_KEY);
+  const t0 = performance.now();
+  let res;
+  try {
+    res = await graphRetrieve(ctx.query, {
+      mcps: ctx.allMcps,
+      graph,
+      edgeParams: g.edges || {},
+      seedMethod: g.seedMethod || 'hybrid',
+      seedK: Number(g.seedK) > 0 ? Math.floor(Number(g.seedK)) : 5,
+      hops: Number(g.hops) > 0 ? Math.floor(Number(g.hops)) : 2,
+      decay: Number.isFinite(g.decay) ? g.decay : 0.5,
+      topK: Number(g.topK) > 0 ? Math.floor(Number(g.topK)) : 8,
+      embedModel,
+      signal: ctx.signal,
+    });
+  } catch (e) {
+    if (e?.name === 'AbortError') throw e;
+    ctx.result.totalLatencyMs += performance.now() - t0;
+    // 그래프 검색 예외 → 전체 카탈로그가 아니라 vector(→keyword) 검색으로 폴백(축소효과 유지, E4).
+    ctx.emit('error', `DB 검색(graph) 실패 — vector 검색으로 폴백합니다: ${e.message}`);
+    await graphVectorFallback('DB 검색(graph 실패→vector 폴백)');
+    return;
+  }
+  ctx.result.totalLatencyMs += performance.now() - t0;
+
+  const results = res.results || [];
+  if (!results.length) {
+    ctx.emit('info', `⚠ DB 검색(graph) 결과 0개 — 전체 카탈로그로 폴백합니다${res.fallbackReason ? ' (' + res.fallbackReason + ')' : ''}.`);
+    return;
+  }
+
+  const reduced = reduceMcps(ctx.allMcps, results);
+  ctx.catalog = buildToolCatalog(reduced);
+
+  const hops = Number(g.hops) > 0 ? Math.floor(Number(g.hops)) : 2;
+  const detail = {
+    seeds: (res.seeds || []).map(s => `${s.serverId}/${s.toolName}(${s.score})`),
+    usedEmbed: res.usedEmbed,
+    fallbackReason: res.fallbackReason || null,
+    servers: reduced.length,
+    tools: results.map(x => ({
+      tool: `${x.serverId}/${x.toolName}`,
+      score: x.score,
+      source: x.source,
+      hop: x.hop,
+      via: (x.viaEdges || []).join('+') || undefined,
+    })),
+  };
+  ctx.emit('info',
+    `DB 검색(graph): ${results.length}개 도구 (시드 ${res.seeds?.length || 0}개, hops=${hops})${res.fallbackReason ? ' · ' + res.fallbackReason : ''}`,
     detail);
 }
 
@@ -510,6 +629,20 @@ async function runReact(ctx) {
     conversation.push({ role: 'user', content: `관찰(observation): ${observation}\n\n다음 사고와 행동, 또는 final_answer를 JSON으로 출력하세요.` });
   }
   ctx.fail(`최대 단계(${ctx.maxSteps})에 도달했지만 final_answer를 생성하지 못했습니다`);
+}
+
+/**
+ * db 전략 실행 — store(vector|graph)로 관련 도구를 검색해 축소 카탈로그를 구성한 뒤,
+ * planningMode(plan|react)에 따라 기존 프롬프트 실행 경로(runPlan/runReact)를 재사용한다.
+ */
+async function runDb(ctx) {
+  const cfg = ctx.strategy.config || {};
+  const dbStore = cfg.store === 'graph' ? 'graph' : 'vector';
+  if (dbStore === 'graph') await applyGraphRetrieval(ctx);
+  else await applyCatalogRetrieval(ctx, { params: cfg.vector || {}, label: 'DB 검색(vector)' });
+
+  if (cfg.planningMode === 'react') await runReact(ctx);
+  else await runPlan(ctx);
 }
 
 async function runSkill(ctx) {
@@ -615,6 +748,7 @@ export async function executeStrategy(strategy, query, { mcps = [], onTrace, sig
         if ((strategy.config?.planningMode) === 'react') await runReact(ctx);
         else await runPlan(ctx);
         break;
+      case 'db': await runDb(ctx); break;
       case 'skill': await runSkill(ctx); break;
       case 'rule': await runRule(ctx); break;
       default: ctx.fail(`알 수 없는 전략 타입: ${strategy?.type}`);

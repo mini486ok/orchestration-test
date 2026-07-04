@@ -84,27 +84,35 @@ export async function checkConnection(timeoutMs = 4000) {
   }
 }
 
+const EMBED_RE = /bge|embed|e5|gte|nomic|minilm/i;
+
 // /api/tags 응답을 뷰가 쓰는 형태로 정규화
-function mapModels(data) {
+// onlyEmbedding=true면 임베딩 모델만, false면 채팅 모델만, null이면 전체
+function mapModels(data, onlyEmbedding = false) {
   return (data.models || [])
-    .filter(m => !/bge|embed/i.test(m.name)) // 임베딩 모델 제외
+    .filter(m => onlyEmbedding === null ? true : (EMBED_RE.test(m.name) === !!onlyEmbedding))
     .map(m => ({
       name: m.name,
       sizeGB: m.size ? (m.size / 1e9).toFixed(1) : '?',
       family: m.details?.family || '',
       paramSize: m.details?.parameter_size || '',
+      isEmbedding: EMBED_RE.test(m.name),
     }));
 }
 
-/** 설치된 모델 목록: [{name, sizeGB, family, paramSize}] */
-export async function listModels() {
+/**
+ * 설치된 모델 목록: [{name, sizeGB, family, paramSize, isEmbedding}]
+ * @param {{embedding?: boolean|null}} opts embedding=false(기본): 채팅 모델만 /
+ *   embedding=true: 임베딩 모델만 / embedding=null: 전체
+ */
+export async function listModels({ embedding = false } = {}) {
   // 서버 모드: 게이트웨이의 /llm/tags 프록시(쿼터 무소모)
   const res = isServerMode()
     ? await gwFetch('/llm/tags')
     : await fetchLNA(getOllamaUrl() + '/api/tags');
   if (!res.ok) throw new Error(`모델 목록 조회 실패 (HTTP ${res.status})`);
   const data = await res.json();
-  return mapModels(data);
+  return mapModels(data, embedding);
 }
 
 /**
