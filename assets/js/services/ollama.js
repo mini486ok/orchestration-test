@@ -16,6 +16,23 @@ export function getNumCtx() {
   return Number(s.numCtx) > 0 ? Number(s.numCtx) : 16384;
 }
 
+/** https 공개 페이지에서 로컬 주소로 접근하는 상황인지 (Chrome 로컬 네트워크 액세스 권한 필요 가능) */
+export function isPublicToLocal() {
+  try {
+    const target = new URL(getOllamaUrl());
+    const local = /^(localhost|127\.|0\.0\.0\.0|\[::1\]|::1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(target.hostname);
+    const pagePublic = location.protocol === 'https:' && !/^(localhost|127\.)/.test(location.hostname);
+    return local && pagePublic;
+  } catch { return false; }
+}
+
+function connectFailHint() {
+  if (isPublicToLocal()) {
+    return 'Ollama 서버에 연결할 수 없습니다. 배포 페이지(https)에서 로컬 Ollama에 접근하려면 ① 브라우저의 "로컬 네트워크 액세스" 권한 허용(주소창 자물쇠 → 사이트 설정), ② OLLAMA_ORIGINS 설정, ③ 보안 확장/정책의 로컬 접근 차단 여부를 확인하세요. 가이드의 "Ollama 연결 설정"을 참고하세요.';
+  }
+  return `Ollama 서버에 연결할 수 없습니다 (${getOllamaUrl()}). Ollama 실행 여부와 OLLAMA_ORIGINS 설정을 확인하세요.`;
+}
+
 /** 연결 확인: {ok, version?, error?} */
 export async function checkConnection(timeoutMs = 4000) {
   const ctrl = new AbortController();
@@ -26,7 +43,8 @@ export async function checkConnection(timeoutMs = 4000) {
     const data = await res.json();
     return { ok: true, version: data.version };
   } catch (e) {
-    return { ok: false, error: e.name === 'AbortError' ? '응답 시간 초과' : (e.message || '연결 실패') };
+    if (e.name === 'AbortError') return { ok: false, error: '응답 시간 초과' };
+    return { ok: false, error: isPublicToLocal() ? '로컬 네트워크 접근이 차단됨(권한/정책 확인 — 가이드 참조)' : (e.message || '연결 실패') };
   } finally {
     clearTimeout(timer);
   }
@@ -74,7 +92,7 @@ export async function chat({ model, messages, temperature = 0.2, format, signal 
     });
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    throw new Error(`Ollama 서버에 연결할 수 없습니다 (${getOllamaUrl()}). Ollama 실행 여부와 OLLAMA_ORIGINS 설정을 확인하세요.`);
+    throw new Error(connectFailHint());
   }
   if (!res.ok) {
     let detail = '';

@@ -35,9 +35,21 @@ const SECTIONS = [
 # 설정 후 작업표시줄 트레이에서 Ollama 종료 → 다시 실행</code></pre>
       <p>특정 출처만 허용하려면 <code>*</code> 대신 <code>https://mini486ok.github.io</code> 를 지정하세요.</p>
       <p><b>연결 확인:</b> 설정 화면의 "저장 후 연결 테스트" 버튼 또는 사이드바 하단의 상태 표시등을 확인하세요.</p>
+      <p><b>Chrome "로컬 네트워크 액세스" 권한 (중요):</b> 최신 Chrome은 공개 사이트(https)가 localhost 등
+      로컬 네트워크에 접근할 때 별도 권한을 요구합니다. 연결이 계속 실패하면 다음을 확인하세요.</p>
+      <ol>
+        <li>첫 연결 시도 시 <b>권한 프롬프트</b>가 뜨면 "허용"을 클릭합니다.</li>
+        <li>프롬프트가 없었다면: 주소창 왼쪽 <b>자물쇠(사이트 정보) → 사이트 설정 → "로컬 네트워크 액세스"를 허용</b>으로 변경 후 새로고침.</li>
+        <li>회사 관리 PC는 보안 정책/에이전트가 로컬 접근을 차단할 수 있습니다. 이 경우 아래 "로컬 실행"을 사용하세요.</li>
+      </ol>
+      <p><b>로컬 실행 (권한 문제가 있을 때의 확실한 대안):</b> 로컬에서 열면 localhost → localhost 통신이라 위 제약이 전혀 없습니다.</p>
+      <pre><code>git clone https://github.com/mini486ok/orchestration-test.git
+cd orchestration-test
+python -m http.server 8000
+# 브라우저에서 http://localhost:8000 접속</code></pre>
       <ul>
         <li>이 페이지를 <b>Ollama가 설치된 PC에서 열어야</b> 합니다. (브라우저 → localhost 호출 구조)</li>
-        <li>다른 PC의 Ollama를 쓰려면 설정에서 주소를 바꿀 수 있으나, https 페이지에서 http 사설 IP 호출은 브라우저가 차단할 수 있습니다(mixed content). 이 경우 로컬에서 앱을 실행하는 방식을 권장합니다.</li>
+        <li>다른 PC의 Ollama를 쓰려면 설정에서 주소를 바꿀 수 있으나, https 페이지에서 http 사설 IP 호출은 브라우저가 차단할 수 있습니다(mixed content). 이 경우 로컬 실행을 권장합니다.</li>
       </ul>`,
   },
   {
