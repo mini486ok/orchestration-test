@@ -129,10 +129,12 @@ export async function health() {
   return res.json(); // { ok, app, version, accountsInitialized, ollama }
 }
 
-export async function setup(username, password) {
+export async function setup(username, password, setupToken) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (setupToken) headers['X-Setup-Token'] = setupToken;
   const res = await gwFetch('/auth/setup', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ username, password }),
   });
   if (!res.ok) throw new Error(await errMessage(res, '초기 설정 실패'));

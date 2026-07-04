@@ -20,7 +20,8 @@ cloudflared 터널은 Ollama(11434) 대신 **게이트웨이(포트 8799)** 를 
     quota: { dailyLimit: int(기본 200), usedToday: int, dateKey: 'YYYY-MM-DD' } }]
   - tokens.json: { token: { username, role, expiresAt(ISO, 발급+7일) } } — 서버 시작 시 만료분 정리
   - shared/{mcps,strategies,benchmarks}.json: { updatedAt: ISO, updatedBy: username, items: [...] }
-- CORS: 모든 응답에 Access-Control-Allow-Origin(허용 목록: https://mini486ok.github.io, http://localhost:*, http://127.0.0.1:* — Origin 헤더가 목록에 맞으면 echo), -Headers: Authorization, Content-Type, -Methods: GET,POST,PUT,DELETE,OPTIONS. OPTIONS 프리플라이트 204.
+- CORS: 모든 응답에 Access-Control-Allow-Origin(허용 목록: https://mini486ok.github.io, http://localhost:*, http://127.0.0.1:* — Origin 헤더가 목록에 맞으면 echo), -Headers: Authorization, Content-Type, X-Setup-Token, -Methods: GET,POST,PUT,DELETE,OPTIONS, -Expose-Headers: X-Quota-Remaining. OPTIONS 프리플라이트 204.
+- 주의: cloudflared 터널을 거치면 클라이언트 IP가 항상 loopback으로 보이므로, 터널로 노출할 때는 반드시 --setup-token(start-gateway.bat이 자동 생성)으로 초기 설정을 보호해야 한다. health.setupTokenRequired가 true면 클라이언트 초기설정 화면이 토큰 입력 필드를 표시한다.
 - 인증: `Authorization: Bearer <token>`. 실패 401 { error }. 만료 토큰 401.
   - 보호 엔드포인트(/llm/*, /data/*, /admin/*, /auth/{logout,me,password})는 **본문 파싱 전 토큰 검증**. 인증 전 본문 상한 64KB(초과 413), 인증 후 6MB. (DoS 완화)
 - 클라이언트 토큰 저장: localStorage `rbtl:gwtoken:<gateway-origin>` (게이트웨이 origin별 분리 — 주소 변경 시 이전 토큰 미전송). gwFetch 401은 첫 건만 이벤트 방출(디바운스).

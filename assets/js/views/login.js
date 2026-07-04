@@ -15,11 +15,15 @@ function authFrame(title, sub, formBody) {
 }
 
 /** 최초 실행: 관리자 계정 생성 */
-export function renderSetup(container, onDone, { mode = 'local', onSubmit } = {}) {
+export function renderSetup(container, onDone, { mode = 'local', onSubmit, setupTokenRequired = false } = {}) {
   const server = mode === 'server';
   const idInput = el('input', { class: 'input', placeholder: '예: admin', autocomplete: 'username' });
   const pw1 = el('input', { class: 'input', type: 'password', placeholder: '6자 이상', autocomplete: 'new-password' });
   const pw2 = el('input', { class: 'input', type: 'password', placeholder: '비밀번호 재입력', autocomplete: 'new-password' });
+  // 서버가 초기 설정 토큰을 요구하는 경우(터널 등 원격 접속)에만 토큰 입력 필드를 표시
+  const tokenInput = (server && setupTokenRequired)
+    ? el('input', { class: 'input mono-input', placeholder: '게이트웨이 실행 창에 표시된 토큰', autocomplete: 'off' })
+    : null;
   const btn = el('button', { class: 'btn btn-primary btn-lg', type: 'submit', style: { width: '100%' } },
     server ? '서버 관리자 계정 생성' : '관리자 계정 생성');
 
@@ -35,10 +39,11 @@ export function renderSetup(container, onDone, { mode = 'local', onSubmit } = {}
     onsubmit: async (e) => {
       e.preventDefault();
       if (pw1.value !== pw2.value) return toast('비밀번호가 일치하지 않습니다.', 'error');
+      if (tokenInput && !tokenInput.value.trim()) return toast('초기 설정 토큰을 입력하세요. (게이트웨이 실행 창에 표시됩니다)', 'error');
       btn.disabled = true;
       try {
         if (onSubmit) {
-          await onSubmit(idInput.value.trim(), pw1.value);
+          await onSubmit(idInput.value.trim(), pw1.value, tokenInput ? tokenInput.value.trim() : undefined);
         } else {
           await auth.createAccount(idInput.value, pw1.value, 'admin');
           await auth.login(idInput.value, pw1.value);
@@ -54,6 +59,7 @@ export function renderSetup(container, onDone, { mode = 'local', onSubmit } = {}
     field({ label: '관리자 아이디', input: idInput, required: true }),
     field({ label: '비밀번호', input: pw1, required: true }),
     field({ label: '비밀번호 확인', input: pw2, required: true }),
+    tokenInput ? field({ label: '초기 설정 토큰', input: tokenInput, required: true, hint: '게이트웨이(start-gateway.bat) 실행 창에 표시된 토큰을 입력하세요. 터널로 접속했을 때 최초 관리자 선점을 막기 위한 것입니다.' }) : null,
     btn,
     note);
 

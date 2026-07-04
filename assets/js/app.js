@@ -344,12 +344,13 @@ async function bootServer() {
     }
     if (!h || !h.ok) { renderGatewayError(new Error('게이트웨이가 정상 상태가 아닙니다.')); return; }
 
-    // (b) 계정 미초기화 → 서버 초기설정
+    // (b) 계정 미초기화 → 서버 초기설정 (setupTokenRequired면 토큰 필드 표시)
     if (!h.accountsInitialized) {
       renderSetup(app, () => boot(), {
         mode: 'server',
-        onSubmit: async (u, p) => {
-          const r = await gateway.setup(u, p);
+        setupTokenRequired: !!h.setupTokenRequired,
+        onSubmit: async (u, p, token) => {
+          const r = await gateway.setup(u, p, token);
           serverIdentity = { username: r.username, role: r.role };
         },
       });

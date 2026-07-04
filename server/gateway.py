@@ -378,7 +378,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin and is_origin_allowed(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Setup-Token")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Expose-Headers", "X-Quota-Remaining")
 
@@ -649,12 +649,17 @@ class Handler(BaseHTTPRequestHandler):
     def _h_health(self):
         with LOCK:
             accounts = load_accounts()
+        client_ip = self.client_address[0] if self.client_address else ""
         self._send_json(200, {
             "ok": True,
             "app": APP_NAME,
             "version": APP_VERSION,
             "accountsInitialized": len(accounts) > 0,
             "ollama": ollama_alive(),
+            # 최초 관리자 생성 화면이 '초기 설정 토큰' 입력 필드를 보여줄지 결정하는 데 사용.
+            # 터널 뒤에서는 클라이언트 IP가 loopback으로 보여 loopback 제한이 무력화되므로,
+            # 원격(터널)에서 안전하게 초기 설정을 하려면 --setup-token 사용이 필요하다.
+            "setupTokenRequired": bool(SETUP_TOKEN),
         })
 
     # ------------------------------------------------------ auth
@@ -1064,7 +1069,13 @@ def print_banner(port, account_count, ollama_ok):
     print(f"  터널 명령    : cloudflared tunnel --url http://localhost:{port}", flush=True)
     print(line, flush=True)
     if account_count == 0:
-        print("  * 웹앱 서버모드 초기설정 화면 또는 POST /auth/setup 으로 관리자 계정을 생성하세요.", flush=True)
+        print("  * 웹앱 서버모드 초기설정 화면에서 관리자 계정을 생성하세요.", flush=True)
+        if SETUP_TOKEN:
+            print("", flush=True)
+            print("  ┌─ 최초 관리자 생성용 초기 설정 토큰 ─────────────────┐", flush=True)
+            print(f"     {SETUP_TOKEN}", flush=True)
+            print("  └────────────────────────────────────────────────────┘", flush=True)
+            print("  초기설정 화면의 '초기 설정 토큰'란에 위 값을 입력하세요.", flush=True)
     print("  * 종료: Ctrl+C", flush=True)
     print(line, flush=True)
 
@@ -1111,7 +1122,23 @@ def main():
     ollama_ok = ollama_alive()
     print_banner(args.port, len(accounts), ollama_ok)
 
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    except OSError as e:
+        # 대표적으로 포트가 이미 사용 중(WinError 10048 / EADDRINUSE)인 경우
+        print("", flush=True)
+        print("=" * 60, flush=True)
+        print(f"  [오류] 포트 {args.port} 에서 서버를 시작할 수 없습니다.", flush=True)
+        print(f"  사유: {e}", flush=True)
+        print("  대부분 게이트웨이가 이미 실행 중일 때 발생합니다.", flush=True)
+        print("   - 실행 중인 다른 게이트웨이 창을 먼저 닫거나,", flush=True)
+        print(f"   - 다른 포트로 실행하세요:  start-gateway.bat --port 8800", flush=True)
+        print("=" * 60, flush=True)
+        try:
+            input("\n계속하려면 Enter 키를 누르세요...")
+        except EOFError:
+            pass
+        return
     server.daemon_threads = True
     try:
         server.serve_forever()

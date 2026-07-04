@@ -63,12 +63,15 @@ python -m http.server 8000
       </ul>
       <p><b>서버 PC에서 (운영자):</b></p>
       <ol>
-        <li><code>server/start-gateway.bat</code> 실행 (게이트웨이 기동, 포트 8799)</li>
+        <li><code>server/start-gateway.bat</code> 실행 (게이트웨이 기동, 포트 8799). <b>실행 창에 표시되는 "초기 설정 토큰"을 확인하세요.</b></li>
         <li><code>server/start-gateway-tunnel.bat</code> 실행 → 표시되는 <code>https://xxxx.trycloudflare.com</code> 주소 확보</li>
-        <li>배포 페이지를 <code>…/?gateway=터널주소</code> 로 열어 <b>서버 관리자 계정을 최초 생성</b></li>
+        <li>배포 페이지를 <code>…/?gateway=터널주소</code> 로 열면 서버 초기설정 화면이 뜹니다. 관리자 아이디·비밀번호와 함께 <b>1번의 초기 설정 토큰을 입력</b>해 최초 관리자 계정을 생성하세요.</li>
         <li>설정 → 게이트웨이 카드의 <b>"🔗 공유 링크 복사"</b>로 팀에 링크 공유, 계정·한도도 여기서 관리</li>
       </ol>
       <p><b>클라이언트 PC에서:</b> 공유받은 링크로 접속 → 서버 계정으로 로그인. 끝.</p>
+      <p class="hint">💡 초기 설정 토큰은 터널을 거치면 모든 접속이 서버 로컬처럼 보이는 특성 때문에, 터널 주소를 아는 제3자가
+      최초 관리자를 선점하지 못하도록 막는 장치입니다. 토큰은 <code>server/data/setup-token.txt</code>에 저장되어 재실행 시 유지되며,
+      최초 관리자 생성 이후에는 더 이상 사용되지 않습니다. 여러 게이트웨이 창을 동시에 띄우면 포트 충돌이 나므로 한 번만 실행하세요.</p>
       <p class="hint">⚠ Quick Tunnel 주소는 터널 재시작 시 바뀝니다(고정 주소는 Cloudflare Named Tunnel 사용).
       게이트웨이가 인증을 강제하므로 터널 주소가 알려져도 계정 없이는 LLM을 쓸 수 없습니다.</p>`,
   },
