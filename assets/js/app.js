@@ -1,9 +1,12 @@
 // 앱 엔트리 — 인증 게이트 → 셸(사이드바/톱바) → 라우터
+// 로컬 모드: 이 브라우저의 localStorage 계정 + Ollama 직접 호출.
+// 서버 모드(settings.gatewayUrl 설정 시): 중앙 게이트웨이가 계정·쿼터·공유 데이터·LLM 중계.
 import { store } from './core/store.js';
 import { router } from './core/router.js';
 import { auth } from './core/auth.js';
-import { el, toast } from './core/ui.js';
+import { el, toast, confirmDialog } from './core/ui.js';
 import { checkConnection } from './services/ollama.js';
+import * as gateway from './services/gateway.js';
 import { SAMPLE_MCPS } from './data/sampleMcps.js';
 import { SAMPLE_STRATEGIES, SAMPLE_BENCHMARKS } from './data/samples.js';
 
@@ -26,6 +29,14 @@ const DEFAULT_SETTINGS = {
   maxSteps: 6,
   numCtx: 16384,
 };
+
+// 서버 모드에서의 현재 사용자(me()/login()/setup() 결과). 로컬 모드에서는 auth.session() 사용.
+let serverIdentity = null;
+let bootingServer = false;
+
+function currentIdentity() {
+  return gateway.isServerMode() ? serverIdentity : auth.session();
+}
 
 /* ---------- 초기 데이터 시드 (기대 타입이 아니면 방어적으로 재시드) ---------- */
 function seed() {
@@ -70,6 +81,7 @@ const TITLES = {
 /* ---------- 셸 ---------- */
 let connTimer = null;
 let routeChangedHandler = null; // renderShell 재호출 시 이전 리스너를 정리하기 위한 모듈 레벨 참조
+let quotaUnsub = null;          // 쿼터 pill 이벤트 구독 해제 함수
 
 function detachRouteChanged() {
   if (routeChangedHandler) {
@@ -78,15 +90,21 @@ function detachRouteChanged() {
   }
 }
 
+function detachQuota() {
+  if (quotaUnsub) { quotaUnsub(); quotaUnsub = null; }
+}
+
 // 로그인/초기설정 화면으로 전환하기 전 셸 관련 리스너·타이머를 정리
 function teardownShell() {
   router.stop();
   detachRouteChanged();
+  detachQuota();
   if (connTimer) { clearInterval(connTimer); connTimer = null; }
 }
 
 function renderShell() {
-  const session = auth.session();
+  const session = currentIdentity() || { username: '사용자', role: 'user' };
+  const serverMode = gateway.isServerMode();
 
   // 사이드바
   const navItems = NAV.map(n => n.section
@@ -99,6 +117,30 @@ function renderShell() {
   const connText = el('span', {}, 'OLLAMA 확인 중…');
   const connPill = el('div', { class: 'conn-pill', title: 'Ollama 연결 상태' }, connDot, connText);
 
+  // 서버 모드: 쿼터 pill + 서버 모드 뱃지
+  detachQuota();
+  let quotaPill = null, serverBadge = null;
+  if (serverMode) {
+    quotaPill = el('div', { class: 'quota-pill', title: '남은 LLM 호출 / 일일 한도 (서버 쿼터)' });
+    const renderQuota = (q) => {
+      if (!q) {
+        quotaPill.replaceChildren(el('span', { class: 'q-ico' }, '🎫'), el('span', {}, 'LLM'), el('span', { class: 'q-num' }, '—'));
+        quotaPill.classList.remove('empty');
+        return;
+      }
+      quotaPill.replaceChildren(
+        el('span', { class: 'q-ico' }, '🎫'),
+        el('span', {}, 'LLM'),
+        el('span', { class: 'q-num' }, `${q.remaining}/${q.dailyLimit}`));
+      quotaPill.classList.toggle('empty', Number(q.remaining) <= 0);
+    };
+    renderQuota(gateway.quotaState());
+    const handler = (e) => renderQuota(e.detail || gateway.quotaState());
+    window.addEventListener('rbtl:gw-quota', handler);
+    quotaUnsub = () => window.removeEventListener('rbtl:gw-quota', handler);
+    serverBadge = el('div', { class: 'gw-mode-badge', title: '중앙 게이트웨이 서버 모드' }, el('span', { class: 'gw-mode-dot' }), '서버 모드');
+  }
+
   const sidebar = el('aside', { class: 'sidebar' },
     el('div', { class: 'brand' },
       el('div', { class: 'brand-signal' }),
@@ -106,11 +148,17 @@ function renderShell() {
     el('nav', { class: 'nav' }, navItems),
     el('div', { class: 'sidebar-foot' },
       connPill,
+      serverMode ? quotaPill : null,
+      serverMode ? serverBadge : null,
       el('div', { class: 'user-pill' },
         el('span', {}, '👤 ', el('b', {}, session.username), session.role === 'admin' ? ' (관리자)' : ''),
         el('button', {
           class: 'btn btn-sm btn-ghost', title: '로그아웃',
-          onclick: () => { auth.logout(); boot(); },
+          onclick: async () => {
+            if (gateway.isServerMode()) { try { await gateway.logout(); } catch { /* 무시 */ } serverIdentity = null; }
+            else auth.logout();
+            boot();
+          },
         }, '로그아웃'))));
 
   // 톱바
@@ -119,6 +167,7 @@ function renderShell() {
   const topbar = el('header', { class: 'topbar' },
     el('div', { class: 'row' }, menuBtn, title),
     el('div', { class: 'topbar-right' },
+      serverMode ? el('span', { class: 'badge green', title: '중앙 게이트웨이 서버 모드' }, '서버 모드') : null,
       el('span', { class: 'badge dim mono', style: { fontFamily: 'var(--font-mono)' } }, 'v1.0')));
 
   const content = el('div', { class: 'content' });
@@ -150,7 +199,7 @@ function renderShell() {
   };
   window.addEventListener('route-changed', routeChangedHandler);
 
-  // Ollama 연결 상태 폴링
+  // Ollama 연결 상태 폴링 (서버 모드에서는 게이트웨이 경유로 LLM 가용성 표시)
   async function pollConn() {
     const r = await checkConnection();
     connDot.className = 'conn-dot ' + (r.ok ? 'ok' : 'bad');
@@ -164,6 +213,10 @@ function renderShell() {
   // 세션이 없으면(만료/타 탭 로그아웃) 라우트 dispatch를 막고 로그인 화면으로 복귀
   router.start(content, {
     before: () => {
+      if (gateway.isServerMode()) {
+        if (!gateway.getToken() || !serverIdentity) { boot(); return false; }
+        return true;
+      }
       if (!auth.session()) { boot(); return false; }
       return true;
     },
@@ -184,11 +237,12 @@ router.register('/evaluation/:runId', renderEvaluation);
 router.register('/settings', renderSettings);
 router.register('/guide', renderGuide);
 
-/* ---------- URL 파라미터로 Ollama 서버 주소 자동 설정 ----------
-   예: https://.../orchestration-test/?ollama=https://xxx.trycloudflare.com
-   서버 운영자가 터널 주소가 포함된 링크 하나를 공유하면 각 클라이언트 설정이 자동 구성된다. */
-let urlParamApplied = null;
-function applyUrlParams() {
+/* ---------- URL 파라미터로 서버 주소 자동 설정 ----------
+   ?ollama=<url> : 로컬 모드에서 다른 PC의 Ollama 터널 주소 자동 설정 (기존)
+   ?gateway=<url>: 서버 모드 게이트웨이 주소 자동 설정 (신규, 동일 검증·정리 방식)
+   서버/게이트웨이 운영자가 주소가 포함된 링크 하나를 공유하면 각 클라이언트 설정이 자동 구성된다. */
+let urlOllamaApplied = null;
+function applyOllamaParam() {
   const p = new URLSearchParams(location.search);
   const o = p.get('ollama');
   if (!o) return;
@@ -197,7 +251,7 @@ function applyUrlParams() {
     if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('scheme');
     const url = (u.origin + u.pathname).replace(/\/+$/, '');
     store.update('settings', s => ({ ...(s && typeof s === 'object' ? s : {}), ollamaUrl: url }));
-    urlParamApplied = url;
+    urlOllamaApplied = url;
     history.replaceState(null, '', location.pathname + location.hash);
   } catch {
     toast('링크의 ollama 주소가 올바르지 않아 무시했습니다.', 'warn');
@@ -205,19 +259,160 @@ function applyUrlParams() {
   }
 }
 
-/* ---------- 부트 ---------- */
-function boot() {
-  seed();
-  if (urlParamApplied === null && location.search.includes('ollama=')) {
-    applyUrlParams();
-    if (urlParamApplied) toast(`링크의 LLM 서버 주소로 설정되었습니다: ${urlParamApplied}`, 'success', 6000);
+let gatewayParamApplied = null;
+async function applyGatewayParam() {
+  const p = new URLSearchParams(location.search);
+  const g = p.get('gateway');
+  if (!g) return;
+  const clearParam = () => history.replaceState(null, '', location.pathname + location.hash);
+
+  let url;
+  try {
+    const u = new URL(g);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('scheme');
+    url = (u.origin + u.pathname).replace(/\/+$/, '');
+  } catch {
+    toast('링크의 gateway 주소가 올바르지 않아 무시했습니다.', 'warn');
+    clearParam();
+    return;
   }
+
+  // 이미 어떤 게이트웨이에 로그인된 상태(토큰 존재)에서 '다른' 주소로 바꾸려는 링크는
+  // 사용자 확인을 받는다(피싱 방어 — 기존 서버 토큰이 낯선 호스트로 향하지 않도록).
+  const currentUrl = gateway.getGatewayUrl();
+  const hasSession = !!gateway.getToken();
+  const changing = currentUrl !== url;
+  if (hasSession && changing) {
+    let host = url;
+    try { host = new URL(url).host; } catch { /* 표시용 폴백 */ }
+    const ok = await confirmDialog(
+      `외부에서 받은 링크가 LLM 게이트웨이 서버를 '${host}'(으)로 변경하려 합니다. 신뢰하는 서버만 허용하세요. 변경할까요?`,
+      { title: '게이트웨이 변경 확인', danger: true, okLabel: '변경' },
+    );
+    clearParam(); // 확인/취소와 무관하게 파라미터는 제거(재프롬프트/부트 루프 방지)
+    if (!ok) { toast('게이트웨이 변경을 취소했습니다. 기존 설정을 유지합니다.', 'warn'); return; }
+    store.update('settings', s => ({ ...(s && typeof s === 'object' ? s : {}), gatewayUrl: url }));
+    gatewayParamApplied = url;
+    return;
+  }
+
+  // 신규(토큰 없음) 또는 동일 주소 → 조용히 적용
+  store.update('settings', s => ({ ...(s && typeof s === 'object' ? s : {}), gatewayUrl: url }));
+  gatewayParamApplied = url;
+  clearParam();
+}
+
+/* ---------- 게이트웨이 접근 불가 오류 화면 ---------- */
+function renderGatewayError(err) {
+  teardownShell();
+  const msg = err?.message || '게이트웨이에 연결할 수 없습니다.';
+  const card = el('div', { class: 'auth-wrap' },
+    el('div', { class: 'auth-card gw-error-card' },
+      el('div', { class: 'auth-head' },
+        el('div', { class: 'gw-error-ico' }, '🚫'),
+        el('div', { class: 'auth-title' }, '게이트웨이 연결 불가'),
+        el('div', { class: 'auth-sub' }, `중앙 서버(${gateway.getGatewayUrl() || '-'})에 연결할 수 없습니다.`)),
+      el('p', { class: 'gw-error-detail' }, msg),
+      el('div', { class: 'row', style: { gap: '10px', marginTop: '4px' } },
+        el('button', { class: 'btn btn-primary', style: { flex: '1' }, onclick: () => boot() }, '🔄 다시 시도'),
+        el('button', {
+          class: 'btn btn-ghost', style: { flex: '1' },
+          onclick: () => {
+            store.update('settings', s => {
+              const n = { ...(s && typeof s === 'object' && !Array.isArray(s) ? s : {}) };
+              delete n.gatewayUrl;
+              return n;
+            });
+            location.reload();
+          },
+        }, '로컬 모드로 전환')),
+      el('div', { class: 'auth-note' }, '로컬 모드로 전환하면 이 브라우저의 로컬 계정·데이터·Ollama 직접 연결로 동작합니다.')));
+  app.replaceChildren(card);
+}
+
+/* ---------- 서버 모드 부트 ---------- */
+async function bootServer() {
+  bootingServer = true;
+  try {
+    teardownShell();
+    let h;
+    try {
+      h = await gateway.health();
+    } catch (e) {
+      renderGatewayError(e);
+      return;
+    }
+    if (!h || !h.ok) { renderGatewayError(new Error('게이트웨이가 정상 상태가 아닙니다.')); return; }
+
+    // (b) 계정 미초기화 → 서버 초기설정
+    if (!h.accountsInitialized) {
+      renderSetup(app, () => boot(), {
+        mode: 'server',
+        onSubmit: async (u, p) => {
+          const r = await gateway.setup(u, p);
+          serverIdentity = { username: r.username, role: r.role };
+        },
+      });
+      return;
+    }
+
+    // (c) 토큰이 있으면 유효성 확인
+    if (gateway.getToken()) {
+      try {
+        const m = await gateway.me();
+        serverIdentity = { username: m.username, role: m.role };
+        await enterServerShell();
+        return;
+      } catch { /* 토큰 무효 — 아래 로그인 화면으로 (gwFetch가 401 시 토큰 폐기) */ }
+    }
+
+    // (c) 토큰 없음/무효 → 서버 로그인
+    renderLogin(app, () => boot(), {
+      mode: 'server',
+      onSubmit: async (u, p) => {
+        const r = await gateway.login(u, p);
+        serverIdentity = { username: r.username, role: r.role };
+      },
+    });
+  } finally {
+    bootingServer = false;
+  }
+}
+
+// (d) 로그인 성공 → 공유 데이터 pull 후 셸 렌더
+async function enterServerShell() {
+  try { await gateway.pullShared(); }
+  catch { /* 초기 동기화 실패는 치명적이지 않음 — 로컬 시드로 진행 */ }
+  renderShell();
+  if (!location.hash || location.hash === '#') location.hash = '#/dashboard';
+}
+
+/* ---------- 부트 ---------- */
+async function boot() {
+  seed();
+
+  // URL 파라미터(로컬/서버) 1회 적용
+  if (urlOllamaApplied === null && location.search.includes('ollama=')) {
+    applyOllamaParam();
+    if (urlOllamaApplied) toast(`링크의 LLM 서버 주소로 설정되었습니다: ${urlOllamaApplied}`, 'success', 6000);
+  }
+  if (gatewayParamApplied === null && location.search.includes('gateway=')) {
+    await applyGatewayParam(); // 이미 로그인 상태에서 다른 게이트웨이면 confirmDialog로 확인
+    if (gatewayParamApplied) toast(`링크의 게이트웨이 서버로 설정되었습니다: ${gatewayParamApplied}`, 'success', 6000);
+  }
+
+  gateway.startSharedSync(); // 공유 키 변경 → 서버 push 구독 (서버 모드에서만 실제 전송, 1회 설정)
+
+  // 서버 모드 분기
+  if (gateway.isServerMode()) { bootServer(); return; }
+
+  // 로컬 모드 (기존 동작)
   if (!auth.hasAccounts()) {
     teardownShell();
-    renderSetup(app, () => boot());
+    renderSetup(app, () => boot(), { mode: 'local' });
   } else if (!auth.session()) {
     teardownShell();
-    renderLogin(app, () => boot());
+    renderLogin(app, () => boot(), { mode: 'local' });
   } else {
     renderShell();
     if (!location.hash || location.hash === '#') location.hash = '#/dashboard';
@@ -233,6 +428,16 @@ window.addEventListener('rbtl:persist-failed', (e) => {
   if (now - last < 5000) return;
   persistFailNotifiedAt.set(key, now);
   toast('저장 공간이 부족하여 일부 데이터가 저장되지 않았습니다. 불필요한 실행 이력을 정리하거나 데이터를 내보낸 뒤 초기화하세요.', 'error', 6000);
+});
+
+/* ---------- 서버 인증 만료(401) → 로그인 화면 복귀 ---------- */
+window.addEventListener('rbtl:gw-unauthorized', () => {
+  if (!gateway.isServerMode()) return;
+  if (bootingServer) return; // 부트 중 토큰 검증 실패는 조용히 로그인 화면으로 처리
+  serverIdentity = null;
+  toast('세션이 만료되었거나 인증이 필요합니다. 다시 로그인해 주세요.', 'warn');
+  teardownShell();
+  boot();
 });
 
 window.addEventListener('error', (e) => {

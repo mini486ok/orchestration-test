@@ -7,6 +7,7 @@ import {
 } from '../core/ui.js';
 import { listModels, checkConnection } from '../services/ollama.js';
 import { executeStrategy, buildToolCatalog, DEFAULT_PLANNER_PROMPT, DEFAULT_SKILL_SELECTOR_PROMPT } from '../services/orchestrator.js';
+import { buildIndex, indexStatus } from '../services/catalogIndex.js';
 
 const TYPE_META = {
   prompt: { label: '프롬프트', kind: 'green', icon: '💬', desc: 'LLM이 도구 카탈로그를 보고 계획(Plan) 또는 ReAct 방식으로 실행합니다.' },
@@ -333,7 +334,128 @@ export async function render(container, ctx) {
           ta,
           el('div', { class: 'row' }, resetBtn),
           catalogPreview),
-      }));
+      }),
+      catalogSection(cfg));
+  }
+
+  /* ---------- 도구 카탈로그 공급 (전체 / 검색 기반 RAG) ---------- */
+  function catalogSection(cfg) {
+    if (cfg.catalogMode !== 'retrieval') cfg.catalogMode = 'full';
+    if (!cfg.retrieval) cfg.retrieval = { method: 'hybrid', topK: 8, threshold: 0, hybridAlpha: 0.5, expandServer: true, expandCategory: false, embedModel: 'bge-m3:latest' };
+    const r = cfg.retrieval;
+
+    // 하이브리드 α 슬라이더 (하이브리드에서만 표시)
+    const alphaLabel = (a) => `${Number(a).toFixed(2)} (벡터)`;
+    const alphaVal = el('span', { class: 'mono', style: { minWidth: '76px' } }, alphaLabel(r.hybridAlpha ?? 0.5));
+    const alphaInput = el('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(r.hybridAlpha ?? 0.5) });
+    alphaInput.addEventListener('input', () => { r.hybridAlpha = Number(alphaInput.value); alphaVal.textContent = alphaLabel(r.hybridAlpha); });
+    const alphaWrap = field({ label: '하이브리드 가중 (α = 벡터 비중)', input: el('div', { class: 'row' }, alphaInput, alphaVal), hint: 'α=1 벡터 전용 · α=0 키워드 전용 · 두 점수 각각 정규화 후 가중합' });
+    alphaWrap.style.display = (r.method === 'hybrid') ? '' : 'none';
+
+    const methodSeg = segmented(
+      [{ value: 'vector', label: '벡터' }, { value: 'keyword', label: '키워드' }, { value: 'hybrid', label: '하이브리드' }],
+      r.method || 'hybrid',
+      (v) => { r.method = v; alphaWrap.style.display = (v === 'hybrid') ? '' : 'none'; });
+
+    const topKInput = el('input', { class: 'input', type: 'number', min: '1', max: '30', value: String(r.topK ?? 8), style: { maxWidth: '120px' } });
+    topKInput.addEventListener('input', () => { r.topK = Math.min(30, Math.max(1, Number(topKInput.value) || 8)); });
+
+    const thVal = el('span', { class: 'mono', style: { minWidth: '34px' } }, String(r.threshold ?? 0));
+    const thInput = el('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(r.threshold ?? 0) });
+    thInput.addEventListener('input', () => { r.threshold = Number(thInput.value); thVal.textContent = thInput.value; });
+
+    const embedI = el('input', { class: 'input', value: r.embedModel || 'bge-m3:latest', style: { maxWidth: '260px' } });
+    // 임베딩 모델을 바꾸면 인덱스가 stale로 감지되므로 상태 카드를 즉시 재평가한다.
+    embedI.addEventListener('input', () => { r.embedModel = embedI.value.trim() || 'bge-m3:latest'; renderStatus(); });
+
+    const expSrv = el('input', { type: 'checkbox', checked: r.expandServer !== false });
+    expSrv.addEventListener('change', () => { r.expandServer = expSrv.checked; });
+    const expCat = el('input', { type: 'checkbox', checked: !!r.expandCategory });
+    expCat.addEventListener('change', () => { r.expandCategory = expCat.checked; });
+    const checks = el('div', { class: 'row wrap', style: { gap: '18px' } },
+      el('label', { class: 'chk-row' }, expSrv, el('span', {}, '같은 서버 도구 포함 (expandServer)')),
+      el('label', { class: 'chk-row' }, expCat, el('span', {}, '같은 카테고리 도구 포함 (expandCategory)')));
+
+    // 인덱스 상태 카드 + 구축/재구축
+    const statusBox = el('div', { class: 'idx-card' });
+    const progBar = el('div', { class: 'idx-prog-fill' });
+    const progText = el('div', { class: 'idx-prog-text' }, '준비 중…');
+    const progWrap = el('div', { class: 'idx-prog', style: { display: 'none' } },
+      el('div', { class: 'idx-prog-track' }, progBar), progText);
+    let building = false;
+
+    function renderStatus() {
+      // 현재 전략의 임베딩 모델을 함께 넘겨, 모델이 인덱스 구축 시점과 다르면 stale로 표시되게 한다.
+      const st = indexStatus(mcps, r.embedModel || 'bge-m3:latest');
+      const rows = [];
+      if (!st.exists) {
+        rows.push(el('div', { class: 'idx-state' }, el('span', { class: 'idx-dot off' }),
+          el('span', {}, '인덱스가 아직 구축되지 않았습니다. 벡터·하이브리드 검색을 사용하려면 먼저 구축하세요(그 전까지 키워드로 폴백).')));
+      } else {
+        rows.push(el('div', { class: 'idx-state' }, el('span', { class: 'idx-dot ' + (st.stale ? 'stale' : 'on') }),
+          el('span', {}, `도구 ${st.docCount}개 인덱싱됨 · ${st.embedModel || '?'} · dim ${st.dim} · 구축 ${fmt.date(st.builtAt)}`)));
+        if (st.stale) rows.push(el('div', { class: 'idx-warn' },
+          '⚠ MCP 구성이 변경되었습니다. 검색 정확도를 위해 인덱스를 재구축하세요(재구축 전까지 벡터·하이브리드는 키워드로 폴백됩니다).'));
+      }
+      const btn = el('button', { class: 'btn btn-sm btn-primary', onclick: build, disabled: building },
+        building ? '구축 중…' : (st.exists ? '↻ 인덱스 재구축' : '⚙ 인덱스 구축'));
+      statusBox.replaceChildren(
+        el('div', { class: 'row between', style: { alignItems: 'flex-start', gap: '12px' } },
+          el('div', { class: 'stack', style: { gap: '6px', minWidth: 0 } }, ...rows), btn),
+        progWrap);
+    }
+
+    async function build() {
+      if (building) return;
+      const conn = await checkConnection();
+      if (!conn.ok) { toast(`인덱스 구축에는 Ollama 연결이 필요합니다 (${conn.error}). 설정에서 연결을 확인하세요.`, 'error'); return; }
+      building = true;
+      progWrap.style.display = '';
+      progBar.style.width = '0%';
+      progText.textContent = '준비 중…';
+      renderStatus();
+      const model = r.embedModel || 'bge-m3:latest';
+      const t0 = performance.now();
+      try {
+        await buildIndex({
+          mcps, embedModel: model,
+          onProgress: ({ done, total }) => {
+            const pct = total ? Math.round(done / total * 100) : 0;
+            progBar.style.width = pct + '%';
+            progText.textContent = `임베딩 ${done}/${total} (${pct}%)`;
+          },
+        });
+        toast(`카탈로그 인덱스를 구축했습니다 · 도구 ${mcps.reduce((n, m) => n + (m.tools?.length || 0), 0)}개 · ${Math.round((performance.now() - t0) / 1000)}초 (${model}).`, 'success');
+      } catch (e) {
+        toast('인덱스 구축 실패: ' + (e?.message || e), 'error');
+      }
+      building = false;
+      progWrap.style.display = 'none';
+      renderStatus();
+    }
+    renderStatus();
+
+    const formBody = el('div', { class: 'stack', style: { display: cfg.catalogMode === 'retrieval' ? '' : 'none', marginTop: '2px' } },
+      field({ label: '검색 방식 (method)', input: methodSeg, hint: '벡터: 임베딩 코사인 · 키워드: 간이 BM25(한글 2-gram) · 하이브리드: 두 점수 결합' }),
+      el('div', { class: 'grid cols-2' },
+        field({ label: '상위 K (topK)', input: topKInput, hint: '검색으로 공급할 도구 수 (1~30)' }),
+        field({ label: '임베딩 모델 (embedModel)', input: embedI, hint: '인덱스 구축·벡터/하이브리드 질의에 사용' })),
+      field({ label: '점수 임계값 (threshold)', input: el('div', { class: 'row' }, thInput, thVal), hint: '이 점수 미만 도구 제외 · 벡터=코사인, 하이브리드=정규화 0~1' }),
+      alphaWrap,
+      field({ label: '이웃 확장', input: checks, hint: '검색된 도구의 서버/카테고리 이웃 도구를 함께 공급합니다.' }),
+      el('div', { class: 'panel-title', style: { marginTop: '4px' } }, '인덱스 상태'),
+      statusBox);
+
+    const modeSeg = segmented(
+      [{ value: 'full', label: '전체 제공' }, { value: 'retrieval', label: '검색 기반 (RAG)' }],
+      cfg.catalogMode || 'full',
+      (v) => { cfg.catalogMode = v; formBody.style.display = (v === 'retrieval') ? '' : 'none'; });
+
+    return el('div', { class: 'stack catalog-section' },
+      el('div', { style: { height: '1px', background: 'var(--line-soft)', margin: '6px 0 2px' } }),
+      el('div', { class: 'panel-title' }, '도구 카탈로그 공급'),
+      field({ input: modeSeg, hint: '전체 제공: 모든 도구를 프롬프트에 나열 · 검색 기반: 질의와 관련된 도구만 검색해 공급(컨텍스트 절약)' }),
+      formBody);
   }
 
   /* ---------- skill 편집기 ---------- */

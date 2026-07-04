@@ -2,3 +2,6 @@
 Thumbs.db
 desktop.ini
 *.log
+server/data/
+__pycache__/
+*.pyc

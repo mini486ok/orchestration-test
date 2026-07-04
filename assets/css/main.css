@@ -849,3 +849,70 @@ input[type=range] { width: 100%; accent-color: var(--sig-green); background: tra
 }
 /* 드로어가 열려 있으면 토스트를 드로어 왼쪽으로 옮겨 겹침 방지 */
 body:has(.drawer) #toast-root { right: min(580px, 96vw); }
+
+/* --- 서버 모드 --- */
+/* 사이드바 쿼터 pill (남은 LLM 호출 / 일일 한도) */
+.quota-pill {
+  display: flex; align-items: center; gap: 7px;
+  background: var(--sig-green-dim); border: 1px solid rgba(49,208,124,.3);
+  border-radius: 99px; padding: 6px 12px; font-size: 11.5px; color: var(--sig-green);
+  font-family: var(--font-mono);
+}
+.quota-pill .q-ico { font-family: var(--font-sans); }
+.quota-pill .q-num { margin-left: auto; font-weight: 600; letter-spacing: .02em; }
+.quota-pill.empty {
+  background: var(--sig-red-dim); border-color: rgba(240,106,93,.4); color: #ff9a8f;
+}
+/* 사이드바 서버 모드 뱃지 */
+.gw-mode-badge {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 10.5px; letter-spacing: .12em; color: var(--tx2);
+  font-family: var(--font-mono); padding: 0 4px;
+}
+.gw-mode-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--sig-green); box-shadow: 0 0 8px rgba(49,208,124,.7);
+  animation: brandpulse 2.2s infinite;
+}
+
+/* 게이트웨이 접근 불가 오류 화면 */
+.gw-error-card { max-width: 460px; }
+.gw-error-ico { font-size: 34px; margin-bottom: 10px; }
+.gw-error-detail {
+  font-size: 12.5px; color: var(--tx1); line-height: 1.6;
+  background: var(--sig-red-dim); border: 1px solid rgba(240,106,93,.3);
+  border-radius: var(--r2); padding: 11px 13px; margin-bottom: 16px;
+}
+
+/* 설정 — 게이트웨이 카드 */
+.panel-subtitle { font-size: 12.5px; font-weight: 600; color: var(--tx0); }
+.gw-divider { height: 1px; background: var(--line-soft); margin: 16px 0 12px; }
+.gw-quota-box { margin-top: 4px; }
+.gw-quota-row { display: flex; gap: 22px; flex-wrap: wrap; }
+.gw-quota-kpi .kpi-value { font-size: 22px; }
+.gw-quota-kpi .kpi-label { font-size: 11px; }
+
+/* --- 카탈로그 리트리버 --- */
+.catalog-section .chk-row {
+  display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--tx1); cursor: pointer;
+}
+.catalog-section .chk-row input[type=checkbox] { accent-color: var(--sig-green); width: 15px; height: 15px; flex-shrink: 0; }
+
+.idx-card {
+  background: var(--bg0); border: 1px solid var(--line-soft); border-radius: var(--r2);
+  padding: 13px; margin-top: 2px;
+}
+.idx-state { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--tx1); line-height: 1.55; }
+.idx-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; background: var(--tx3); }
+.idx-dot.on { background: var(--sig-green); box-shadow: 0 0 6px rgba(49,208,124,.5); }
+.idx-dot.stale { background: var(--sig-amber); box-shadow: 0 0 6px rgba(244,182,63,.5); }
+.idx-dot.off { background: var(--tx3); }
+.idx-warn {
+  font-size: 11.5px; color: var(--sig-amber); line-height: 1.55;
+  background: var(--sig-amber-dim); border: 1px solid rgba(244,182,63,.3);
+  border-radius: var(--r1); padding: 7px 10px;
+}
+.idx-prog { margin-top: 11px; }
+.idx-prog-track { height: 6px; background: var(--bg2); border-radius: 3px; overflow: hidden; }
+.idx-prog-fill { height: 100%; width: 0; background: var(--sig-green); border-radius: 3px; transition: width .18s var(--ease); }
+.idx-prog-text { font-family: var(--font-mono); font-size: 11px; color: var(--tx2); margin-top: 5px; }

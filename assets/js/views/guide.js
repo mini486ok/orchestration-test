@@ -53,33 +53,44 @@ python -m http.server 8000
       </ul>`,
   },
   {
-    title: '🌐 다른 PC에서 이 서버의 LLM 사용하기',
+    title: '🖥 서버 모드 — 중앙 계정·쿼터·데이터 공유 (권장)',
     html: `
-      <p>서버 PC(Ollama가 설치된 PC) 한 대를 팀이 함께 쓸 수 있습니다. <b>방법 A(터널)를 권장</b>합니다 —
-      https 주소라 브라우저 제약(mixed content, 로컬 네트워크 권한)이 전혀 없고, 같은 네트워크가 아니어도 동작합니다.</p>
-
-      <p><b>방법 A. Cloudflare Tunnel (권장)</b></p>
+      <p>서버 PC(이 프로젝트의 <code>server/gateway.py</code>를 실행하는 PC)가 <b>중앙 게이트웨이</b>가 되어 팀 전체가 함께 씁니다.</p>
+      <ul>
+        <li><b>중앙 계정</b> — 계정을 서버에서 관리합니다. 서버에 계정이 있어야만 로그인·LLM 사용이 가능합니다.</li>
+        <li><b>LLM 호출 쿼터</b> — 계정별 일일 호출 한도를 관리자(설정 화면)가 지정하며, 한도를 초과하면 LLM 호출이 거부됩니다. 남은 호출 수는 사이드바에 표시됩니다.</li>
+        <li><b>데이터 공유</b> — MCP·전략·벤치마크가 서버에 저장되어 <b>모든 PC에서 동일하게</b> 보입니다(변경 시 자동 저장, 마지막 저장 우선 — 동시에 같은 항목을 편집하면 나중 저장이 이깁니다. 설정 → "지금 동기화"로 수동 갱신 가능). 평가 이력(runs)은 개인 브라우저에만 저장됩니다.</li>
+      </ul>
+      <p><b>서버 PC에서 (운영자):</b></p>
       <ol>
-        <li><b>서버 PC:</b> <a href="https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" target="_blank" rel="noopener">cloudflared</a> 설치 후 실행:
-          <pre><code>cloudflared tunnel --url http://localhost:11434 --no-autoupdate</code></pre>
-          출력에 표시되는 <code>https://xxxx.trycloudflare.com</code> 주소가 LLM 서버 주소입니다.
-          (repo의 <code>tools/start-ollama-tunnel.bat</code> 더블클릭으로도 실행 가능)</li>
-        <li><b>서버 PC:</b> Ollama가 이 웹앱 출처를 허용해야 합니다 — <code>OLLAMA_ORIGINS</code>에 <code>https://mini486ok.github.io</code> 설정 후 Ollama 재시작.</li>
-        <li><b>클라이언트 PC:</b> 설정 → Ollama 서버 주소에 터널 주소를 입력하거나, 서버 운영자가 설정 화면의
-          <b>"🔗 공유 링크 복사"</b>로 만든 링크(<code>…/?ollama=터널주소</code>)로 접속하면 <b>자동 설정</b>됩니다.</li>
+        <li><code>server/start-gateway.bat</code> 실행 (게이트웨이 기동, 포트 8799)</li>
+        <li><code>server/start-gateway-tunnel.bat</code> 실행 → 표시되는 <code>https://xxxx.trycloudflare.com</code> 주소 확보</li>
+        <li>배포 페이지를 <code>…/?gateway=터널주소</code> 로 열어 <b>서버 관리자 계정을 최초 생성</b></li>
+        <li>설정 → 게이트웨이 카드의 <b>"🔗 공유 링크 복사"</b>로 팀에 링크 공유, 계정·한도도 여기서 관리</li>
       </ol>
-      <p class="hint">⚠ Quick Tunnel 주소는 터널을 재시작할 때마다 바뀝니다. 고정 주소가 필요하면 Cloudflare 계정+도메인으로
-      Named Tunnel을 만드세요. 또한 터널 주소를 아는 사람은 누구나 LLM을 호출할 수 있으니(별도 인증 없음) 주소 공유에 유의하세요.</p>
-
+      <p><b>클라이언트 PC에서:</b> 공유받은 링크로 접속 → 서버 계정으로 로그인. 끝.</p>
+      <p class="hint">⚠ Quick Tunnel 주소는 터널 재시작 시 바뀝니다(고정 주소는 Cloudflare Named Tunnel 사용).
+      게이트웨이가 인증을 강제하므로 터널 주소가 알려져도 계정 없이는 LLM을 쓸 수 없습니다.</p>`,
+  },
+  {
+    title: '🌐 (대안) 서버 없이 LLM만 공유하기',
+    html: `
+      <p>중앙 계정·쿼터·데이터 공유가 필요 없다면, 게이트웨이 없이 Ollama만 노출할 수도 있습니다.
+      이 경우 각 PC의 데이터는 각자 브라우저에 저장되고(공유 안 됨), LLM 호출 제한도 없습니다.</p>
+      <p><b>방법 A. Ollama 직접 터널</b></p>
+      <ol>
+        <li><b>서버 PC:</b> <code>tools/start-ollama-tunnel.bat</code> 실행 → <code>https://xxxx.trycloudflare.com</code> 주소 확보.
+          <code>OLLAMA_ORIGINS</code>에 <code>https://mini486ok.github.io</code> 설정 + Ollama 재시작 필요.</li>
+        <li><b>클라이언트 PC:</b> <code>…/?ollama=터널주소</code> 링크로 접속(자동 설정) 또는 설정에서 직접 입력.</li>
+      </ol>
+      <p class="hint">⚠ 이 방식은 터널 주소를 아는 누구나 인증 없이 LLM을 호출할 수 있습니다.</p>
       <p><b>방법 B. 같은 네트워크(LAN) 직접 연결</b></p>
       <ol>
-        <li><b>서버 PC:</b> <code>OLLAMA_HOST=0.0.0.0:11434</code> 환경변수 설정 + Ollama 재시작, 방화벽 인바운드 허용(관리자 PowerShell):
+        <li><b>서버 PC:</b> <code>OLLAMA_HOST=0.0.0.0:11434</code> 환경변수 + Ollama 재시작, 방화벽 인바운드 허용(관리자 PowerShell):
           <pre><code>netsh advfirewall firewall add rule name="Ollama 11434" dir=in action=allow protocol=TCP localport=11434 profile=private,domain</code></pre></li>
-        <li><b>클라이언트 PC:</b> 설정에서 주소를 <code>http://서버IP:11434</code>로 변경. Chrome/Edge에서
-          "로컬 네트워크 액세스" 권한 프롬프트가 뜨면 허용합니다.</li>
-      </ol>
-      <p class="hint">방법 B는 https 페이지에서 http 사설 IP를 호출하므로 브라우저·정책에 따라 차단될 수 있습니다(Chrome/Edge 최신 버전 필요).
-      문제가 있으면 방법 A를 사용하세요. LAN 개방 시 같은 네트워크의 누구나 Ollama를 호출할 수 있다는 점도 유의하세요.</p>`,
+        <li><b>클라이언트 PC:</b> 설정에서 주소를 <code>http://서버IP:11434</code>로 변경. Chrome/Edge의
+          "로컬 네트워크 액세스" 권한 프롬프트를 허용합니다(브라우저·정책에 따라 차단될 수 있음 — 문제가 있으면 터널 방식 사용).</li>
+      </ol>`,
   },
   {
     title: '🧠 오케스트레이션 전략 3가지',
@@ -90,6 +101,23 @@ python -m http.server 8000
         <li><b>스킬 기반</b> — 자주 쓰는 작업 흐름을 "스킬"(트리거 설명 + 단계 시퀀스)로 정의하면, LLM이 질의에 맞는 스킬을 선택해 실행합니다. 단계 파라미터는 LLM 채움 또는 템플릿(<code>{{QUERY}}</code>, <code>{{step1.output.필드}}</code>) 방식을 지원합니다.</li>
         <li><b>룰 기반</b> — 키워드/정규식 조건과 워크플로우를 매핑합니다. LLM 없이 결정적으로 동작하며, 매칭 실패 시 오류 처리 또는 LLM 폴백을 선택할 수 있습니다.</li>
       </ul>`,
+  },
+  {
+    title: '🔎 검색 기반 카탈로그 (RAG) — 프롬프트 전략의 카탈로그 DB화',
+    html: `
+      <p>등록된 도구가 많아지면 전체 카탈로그를 프롬프트에 넣는 방식은 컨텍스트를 낭비하고 모델의 도구 선택을 방해합니다.
+      <b>검색 기반 카탈로그</b>는 MCP 카탈로그를 별도 인덱스(DB)로 구축해 두고, <b>질의와 관련된 도구만 골라 플래너에 공급</b>합니다.
+      프롬프트 전략 편집기의 "도구 카탈로그" 섹션에서 설정하며, 샘플 전략 <b>"검색증강 플래너 (RAG)"</b>가 기본 제공됩니다.</p>
+      <ul>
+        <li><b>인덱스 구축</b> — 도구별 설명 텍스트를 임베딩 모델(기본 <code>bge-m3</code>)로 벡터화해 브라우저에 저장합니다(도구 90개 기준 수 초·약 0.7MB).
+          <b>인덱스는 브라우저별로 저장</b>되며, MCP 목록이 바뀌면 "재구축 필요" 경고가 표시됩니다.</li>
+        <li><b>검색 방식(method)</b> — <code>vector</code>(임베딩 코사인 유사도) / <code>keyword</code>(BM25, 인덱스·임베딩 불필요) / <code>hybrid</code>(두 점수 가중합, α로 비중 조절).</li>
+        <li><b>top-K / 임계값(threshold)</b> — 상위 몇 개 도구를 공급할지, 유사도 최소 기준.</li>
+        <li><b>그래프성 확장(expand)</b> — 선택된 도구와 <b>같은 서버</b>의 나머지 도구(expandServer), <b>같은 카테고리</b> 서버의 도구(expandCategory)를 이웃으로 추가해 연계 워크플로우 누락을 줄입니다.</li>
+      </ul>
+      <p class="hint">검색 결과가 0개면 자동으로 전체 카탈로그로 폴백합니다(트레이스에 경고 표시). 벡터/하이브리드 검색의 임베딩 호출은
+      LLM 호출 수에 포함되지 않습니다. 평가·비교 화면에서 전체 카탈로그 전략과 RAG 전략을 나란히 돌려
+      정확도(F1)와 컨텍스트 효율을 직접 비교해 보세요 — 이것이 이 플랫폼이 의도한 사용법입니다.</p>`,
   },
   {
     title: '📏 평가 지표 설명',

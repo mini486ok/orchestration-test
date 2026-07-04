@@ -1,5 +1,7 @@
 // Ollama 로컬 LLM 클라이언트 — 모든 LLM 호출은 이 모듈을 경유
+// 서버 모드(게이트웨이 설정 시)에서는 게이트웨이가 LLM 을 중계한다. 로컬 모드 동작은 기존과 동일.
 import { store } from '../core/store.js';
+import { isServerMode, gwFetch, setQuotaRemaining } from './gateway.js';
 
 export function getOllamaUrl() {
   const s = store.get('settings') || {};
@@ -66,23 +68,24 @@ export async function checkConnection(timeoutMs = 4000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetchLNA(getOllamaUrl() + '/api/version', { signal: ctrl.signal });
+    // 서버 모드: 게이트웨이의 /llm/version(내부 Ollama 프록시)으로 LLM 가용성 확인
+    const res = isServerMode()
+      ? await gwFetch('/llm/version', { signal: ctrl.signal })
+      : await fetchLNA(getOllamaUrl() + '/api/version', { signal: ctrl.signal });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
     const data = await res.json();
     return { ok: true, version: data.version };
   } catch (e) {
     if (e.name === 'AbortError') return { ok: false, error: '응답 시간 초과' };
+    if (isServerMode()) return { ok: false, error: e.message || '게이트웨이 연결 실패' };
     return { ok: false, error: isPublicToLocal() ? '로컬 네트워크 접근이 차단됨(권한/정책 확인 — 가이드 참조)' : (e.message || '연결 실패') };
   } finally {
     clearTimeout(timer);
   }
 }
 
-/** 설치된 모델 목록: [{name, sizeGB, family, paramSize}] */
-export async function listModels() {
-  const res = await fetchLNA(getOllamaUrl() + '/api/tags');
-  if (!res.ok) throw new Error(`모델 목록 조회 실패 (HTTP ${res.status})`);
-  const data = await res.json();
+// /api/tags 응답을 뷰가 쓰는 형태로 정규화
+function mapModels(data) {
   return (data.models || [])
     .filter(m => !/bge|embed/i.test(m.name)) // 임베딩 모델 제외
     .map(m => ({
@@ -91,6 +94,17 @@ export async function listModels() {
       family: m.details?.family || '',
       paramSize: m.details?.parameter_size || '',
     }));
+}
+
+/** 설치된 모델 목록: [{name, sizeGB, family, paramSize}] */
+export async function listModels() {
+  // 서버 모드: 게이트웨이의 /llm/tags 프록시(쿼터 무소모)
+  const res = isServerMode()
+    ? await gwFetch('/llm/tags')
+    : await fetchLNA(getOllamaUrl() + '/api/tags');
+  if (!res.ok) throw new Error(`모델 목록 조회 실패 (HTTP ${res.status})`);
+  const data = await res.json();
+  return mapModels(data);
 }
 
 /**
@@ -109,6 +123,9 @@ export async function chat({ model, messages, temperature = 0.2, format, signal 
     options: { temperature, num_ctx: numCtx },
   };
   if (format === 'json') body.format = 'json';
+
+  // 서버 모드: 게이트웨이 /llm/chat 경유 (쿼터 소모, X-Quota-Remaining 헤더 반영)
+  if (isServerMode()) return chatViaGateway(body, useModel, t0, signal);
 
   let res;
   try {
@@ -133,6 +150,91 @@ export async function chat({ model, messages, temperature = 0.2, format, signal 
     durationMs: performance.now() - t0,
     model: useModel,
   };
+}
+
+// 서버 모드 chat — 게이트웨이 /llm/chat. 429 는 한도 소진 오류, X-Quota-Remaining 으로 쿼터 갱신.
+async function chatViaGateway(body, useModel, t0, signal) {
+  let res;
+  try {
+    res = await gwFetch('/llm/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    throw new Error('게이트웨이에 연결할 수 없습니다. 게이트웨이 주소와 서버 상태를 확인하세요.');
+  }
+  const rem = res.headers.get('X-Quota-Remaining');
+  if (rem !== null) setQuotaRemaining(rem);
+  if (res.status === 429) {
+    throw new Error('오늘의 LLM 호출 한도를 모두 사용했습니다(남은 호출 0). 관리자에게 한도 상향을 요청하세요.');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+    throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
+  }
+  const data = await res.json();
+  return {
+    content: data.message?.content ?? '',
+    durationMs: performance.now() - t0,
+    model: useModel,
+  };
+}
+
+/**
+ * 임베딩 생성 — Ollama /api/embed
+ * @param {{model?: string, input: string|string[], signal?}} opts
+ * @returns {Promise<number[][]>} 입력 순서대로의 임베딩 벡터 배열
+ */
+export async function embed({ model = 'bge-m3:latest', input, signal } = {}) {
+  // 서버 모드: 게이트웨이 /llm/embed 프록시 (쿼터 무소모)
+  if (isServerMode()) return embedViaGateway({ model, input, signal });
+
+  let res;
+  try {
+    res = await fetchLNA(getOllamaUrl() + '/api/embed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input }),
+      signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    throw new Error(connectFailHint());
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+    throw new Error(`임베딩 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''} — 임베딩 모델(${model}) 설치 여부를 확인하세요.`);
+  }
+  const data = await res.json();
+  return data.embeddings || [];
+}
+
+// 서버 모드 embed — 게이트웨이 /llm/embed
+async function embedViaGateway({ model, input, signal }) {
+  let res;
+  try {
+    res = await gwFetch('/llm/embed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input }),
+      signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    throw new Error('게이트웨이에 연결할 수 없습니다. 임베딩 요청을 보낼 수 없습니다.');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+    throw new Error(`임베딩 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''} — 임베딩 모델(${model}) 설치 여부를 확인하세요.`);
+  }
+  const data = await res.json();
+  return data.embeddings || [];
 }
 
 // 한 후보 문자열에서 JSON을 추출: 전체 파싱 → 실패 시 모든 '{'/'[' 시작 위치를 순서대로 시도(최대 20개)

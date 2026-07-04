@@ -3,6 +3,7 @@
 // executeStrategy는 절대 throw하지 않고 항상 ExecutionResult를 반환한다.
 import { chatJSON, getDefaultModel, getNumCtx } from './ollama.js';
 import { executeTool, validateParams } from './mockEngine.js';
+import { retrieve } from './catalogIndex.js';
 
 /* ============================================================
    기본 프롬프트
@@ -156,6 +157,7 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
 
   const ctx = {
     strategy, query, date, catalog, byId, result, emit, signal, failOnStepError,
+    allMcps: mcps || [],
     model: strategy?.model || getDefaultModel(),
     temperature: Number.isFinite(cfg.temperature) ? cfg.temperature : 0.2,
     // 스킬 선택·파라미터 생성 등 내부 보조 호출용 온도: 명시 설정(온도 통일 포함)이 있으면 따르고, 없으면 안정성을 위해 0.1
@@ -347,6 +349,86 @@ async function runSteps(ctx, steps, { paramFill = 'template' } = {}) {
 }
 
 /* ============================================================
+   카탈로그 검색 기반 공급(retrieval)
+   ============================================================ */
+
+/** 검색 결과 도구들만으로 축소 MCP 배열 구성(서버·도구 순서 보존) */
+function reduceMcps(mcps, results) {
+  const wanted = new Map(); // serverId -> Set(toolName)
+  for (const r of results) {
+    if (!wanted.has(r.serverId)) wanted.set(r.serverId, new Set());
+    wanted.get(r.serverId).add(r.toolName);
+  }
+  const out = [];
+  for (const srv of mcps || []) {
+    const set = wanted.get(srv.id);
+    if (!set) continue;
+    const tools = (srv.tools || []).filter(t => set.has(t.name));
+    if (tools.length) out.push({ ...srv, tools });
+  }
+  return out;
+}
+
+/**
+ * catalogMode==='retrieval'일 때 ctx.catalog를 축소 카탈로그로 교체.
+ * 임베딩(vector/hybrid)은 LLM 호출로 세지 않는다 — llmCalls 미증가, totalLatencyMs만 반영.
+ */
+async function applyCatalogRetrieval(ctx) {
+  const cfg = ctx.strategy.config || {};
+  const r = cfg.retrieval || {};
+  const method = r.method || 'hybrid';
+  const topK = Number(r.topK) > 0 ? Math.floor(Number(r.topK)) : 8;
+
+  const t0 = performance.now();
+  let res;
+  try {
+    res = await retrieve(ctx.query, {
+      mcps: ctx.allMcps,
+      method,
+      topK,
+      threshold: Number.isFinite(r.threshold) ? r.threshold : 0,
+      hybridAlpha: Number.isFinite(r.hybridAlpha) ? r.hybridAlpha : 0.5,
+      expandServer: r.expandServer !== false,
+      expandCategory: !!r.expandCategory,
+      embedModel: r.embedModel || 'bge-m3:latest',
+      signal: ctx.signal,
+    });
+  } catch (e) {
+    if (e?.name === 'AbortError') throw e;
+    ctx.result.totalLatencyMs += performance.now() - t0; // 임베딩 시도 지연도 총 지연에 포함
+    ctx.emit('error', `카탈로그 검색 실패 — 전체 카탈로그로 폴백: ${e.message}`);
+    return;
+  }
+  ctx.result.totalLatencyMs += performance.now() - t0;
+
+  const results = res.results || [];
+  if (!results.length) {
+    ctx.emit('info', `⚠ 카탈로그 검색 결과 0개 — 전체 카탈로그로 폴백합니다 (${res.usedMethod}${res.fallbackReason ? ', ' + res.fallbackReason : ''}).`);
+    return;
+  }
+
+  const reduced = reduceMcps(ctx.allMcps, results);
+  ctx.catalog = buildToolCatalog(reduced);
+
+  const detail = {
+    method: res.usedMethod,
+    requestedMethod: res.requestedMethod,
+    topK: res.topK,
+    threshold: res.threshold,
+    fallbackReason: res.fallbackReason || null,
+    servers: reduced.length,
+    tools: results.map(x => ({
+      tool: `${x.serverId}/${x.toolName}`,
+      score: Math.round((x.score || 0) * 1e4) / 1e4,
+      source: x.source,
+    })),
+  };
+  ctx.emit('info',
+    `카탈로그 검색: ${results.length}개 도구 선택 (${res.usedMethod}, topK=${topK})${res.fallbackReason ? ' · 폴백: ' + res.fallbackReason : ''}`,
+    detail);
+}
+
+/* ============================================================
    실행기: plan / react / skill / rule
    ============================================================ */
 
@@ -529,6 +611,7 @@ export async function executeStrategy(strategy, query, { mcps = [], onTrace, sig
 
     switch (strategy?.type) {
       case 'prompt':
+        if (strategy.config?.catalogMode === 'retrieval') await applyCatalogRetrieval(ctx);
         if ((strategy.config?.planningMode) === 'react') await runReact(ctx);
         else await runPlan(ctx);
         break;

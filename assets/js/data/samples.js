@@ -8,6 +8,7 @@
 //  2) sample-strategy-2  prompt(react)  ReAct 탐색형
 //  3) sample-strategy-3  skill          여객 안내 스킬셋 (스킬 3종)
 //  4) sample-strategy-4  rule           키워드 라우팅 룰셋 (룰 5종)
+//  5) sample-strategy-5  prompt(plan)   검색증강 플래너 (RAG · catalogMode=retrieval)
 //
 // [벤치마크]
 //  sample-benchmark-basic  기본 검증 세트 (항목 10개, easy 4 / medium 4 / hard 2)
@@ -276,6 +277,67 @@ export const SAMPLE_STRATEGIES = [
           ]
         }
       ]
+    }
+  },
+
+  // --------------------------------------------------------------------------
+  // 5. 프롬프트 기반 — 검색증강 플래너 (RAG · catalogMode='retrieval')
+  //    전략1과 동일한 시스템 프롬프트를 사용하되, 전체 카탈로그 대신 질의와 관련된
+  //    도구만 검색(하이브리드)으로 공급해 컨텍스트를 절약한다.
+  //    ※ 실행 전, 오케스트레이션 화면의 "도구 카탈로그 공급" 섹션에서 인덱스를 먼저 구축해야 한다.
+  // --------------------------------------------------------------------------
+  {
+    id: 'sample-strategy-5',
+    name: '검색증강 플래너 (RAG)',
+    description: '기본 플래너와 동일한 프롬프트를 쓰되, 모든 도구를 나열하는 대신 질의와 관련된 도구만 검색(하이브리드)으로 골라 공급해 프롬프트 컨텍스트를 절약하는 플래너. 도구가 많아질수록 토큰 효율과 계획 정확도 이점이 커진다. ⚠ 실행 전 오케스트레이션 화면의 "도구 카탈로그 공급" 섹션에서 카탈로그 인덱스를 먼저 구축해야 한다(미구축 시 키워드 검색으로 폴백).',
+    type: 'prompt',
+    model: null,
+    createdAt: '2026-07-04T00:00:00Z',
+    updatedAt: '2026-07-04T00:00:00Z',
+    config: {
+      planningMode: 'plan',
+      temperature: 0.1,
+      maxSteps: 6,
+      catalogMode: 'retrieval',
+      retrieval: {
+        method: 'hybrid',
+        topK: 8,
+        threshold: 0,
+        hybridAlpha: 0.5,
+        expandServer: true,
+        expandCategory: false,
+        embedModel: 'bge-m3:latest'
+      },
+      systemPrompt: [
+        '당신은 철도·교통 분야의 MCP 오케스트레이터입니다. 사용자 질의를 해결하기 위해 사용 가능한 MCP 도구들을 조합하여 하나의 실행 계획(plan)을 세웁니다.',
+        '',
+        '[오늘 날짜]',
+        '{{DATE}}',
+        '',
+        '[사용 가능한 도구 목록]',
+        '{{TOOL_CATALOG}}',
+        '',
+        '[계획 수립 지침]',
+        '- 질의 해결에 실제로 필요한 도구만 선택하고, 논리적 실행 순서대로 배열하세요.',
+        '- 각 도구의 params 에는 그 도구의 입력 스키마에 존재하는 키만 사용합니다.',
+        '- 각 단계의 params는 질의에서 직접 추출해 채우세요. 앞 단계 출력값이 필요하면 {{step1.output.필드}} 형식으로 참조할 수 있습니다.',
+        '- "내일", "이번 주말" 같은 상대 날짜는 {{DATE}} 를 기준으로 YYYY-MM-DD 형식으로 변환하세요.',
+        '- 불필요한 도구를 남발하지 말고 최소한의 단계로 해결하세요. 해결 불가한 질의면 plan 을 빈 배열로 두고 reasoning 에 이유를 적습니다.',
+        '',
+        '[응답 형식]',
+        '{"plan":[{"server":"서버id","tool":"도구명","params":{"키":"값"}}],"reasoning":"선택 근거를 한 문장으로"}',
+        '',
+        '[예시]',
+        '질의: "내일 아침 서울에서 부산 가는 KTX 알려줘"',
+        '출력: {"plan":[{"server":"kr-train-schedule","tool":"search_trains","params":{"from":"서울","to":"부산","trainType":"KTX"}}],"reasoning":"출발·도착역과 열차종별로 편성을 검색하면 되므로 단일 도구로 충분함"}',
+        '질의: "모레 서울에서 동대구 가는 KTX 예매하려는데 자리 있는지 봐줘"',
+        '출력: {"plan":[{"server":"kr-train-schedule","tool":"search_trains","params":{"from":"서울","to":"동대구","trainType":"KTX"}},{"server":"rail-reservation","tool":"check_seat_availability","params":{"trainNo":"{{step1.output.trains.0.trainNo}}","date":"{{DATE}}"}}],"reasoning":"편성을 먼저 검색하고 첫 열차 번호로 잔여석을 확인하는 2단계 흐름"}',
+        '',
+        '[사용자 질의]',
+        '{{QUERY}}',
+        '',
+        '반드시 위 [응답 형식]의 순수 JSON 한 덩어리만 출력하세요. 설명 문장·마크다운·코드펜스 없이 JSON만 출력합니다.'
+      ].join('\n')
     }
   }
 ];
