@@ -55,24 +55,46 @@ function seed() {
   ensureArray('runs', []);
 
   // 샘플 버전 동기화: 앱이 업데이트되어 새 기본 샘플(MCP·전략·벤치마크)이 추가되면,
-  // 기존 사용자의 localStorage에도 신규 샘플(id가 아직 없는 것)만 1회 병합한다.
+  // 기존 사용자의 localStorage에도 신규 샘플(id가 아직 없는 것)만 병합한다.
   // 사용자가 만든 항목·수정 내용은 그대로 보존하며, 버전당 한 번만 실행되어
   // 사용자가 삭제한 샘플을 매 로드마다 되살리지 않는다.
   // (v2: MCP 30→100종, 벤치마크 1→11세트, DB 전략 샘플 추가)
-  const SAMPLE_VERSION = 2;
+  // v3: 저장 성공을 검증하고 실패 시 버전을 올리지 않는다. store.set은 용량 초과 등
+  //     실패 시 false를 반환하고 롤백하는데, 이전엔 이를 무시하고 버전을 기록해
+  //     병합이 누락된 채 영구히 건너뛰던 고착 문제가 있었다. 버전을 올려 재병합을 유도.
+  const SAMPLE_VERSION = 3;
   const seededVer = Number(store.get('sampleSeedVersion') || 0);
   if (seededVer < SAMPLE_VERSION) {
     const mergeSamples = (key, samples) => {
       const cur = store.get(key);
-      if (!Array.isArray(cur) || !Array.isArray(samples)) return;
+      if (!Array.isArray(cur) || !Array.isArray(samples)) return { ok: true, added: 0 };
       const ids = new Set(cur.map((x) => x && x.id));
       const additions = samples.filter((s) => s && s.id && !ids.has(s.id));
-      if (additions.length) store.set(key, [...cur, ...additions]);
+      if (!additions.length) return { ok: true, added: 0 };
+      const ok = store.set(key, [...cur, ...additions]); // 저장 실패 시 false(롤백)
+      return { ok, added: ok ? additions.length : 0 };
     };
-    mergeSamples('mcps', SAMPLE_MCPS);
-    mergeSamples('strategies', SAMPLE_STRATEGIES);
-    mergeSamples('benchmarks', SAMPLE_BENCHMARKS);
-    store.set('sampleSeedVersion', SAMPLE_VERSION);
+    let r = {
+      mcps: mergeSamples('mcps', SAMPLE_MCPS),
+      strategies: mergeSamples('strategies', SAMPLE_STRATEGIES),
+      benchmarks: mergeSamples('benchmarks', SAMPLE_BENCHMARKS),
+    };
+    // 저장 실패(용량 초과 가능) 시: 오래된 실행 이력(runs)을 최근 5개만 남기고 정리해
+    // 공간을 확보한 뒤 1회 재시도한다(실행 이력은 재생성 가능한 데이터).
+    if (!r.mcps.ok || !r.strategies.ok || !r.benchmarks.ok) {
+      const runs = store.get('runs');
+      if (Array.isArray(runs) && runs.length > 5) store.set('runs', runs.slice(-5));
+      if (!r.mcps.ok) r.mcps = mergeSamples('mcps', SAMPLE_MCPS);
+      if (!r.strategies.ok) r.strategies = mergeSamples('strategies', SAMPLE_STRATEGIES);
+      if (!r.benchmarks.ok) r.benchmarks = mergeSamples('benchmarks', SAMPLE_BENCHMARKS);
+    }
+    if (r.mcps.ok && r.strategies.ok && r.benchmarks.ok) {
+      store.set('sampleSeedVersion', SAMPLE_VERSION); // 전부 성공했을 때만 버전 확정
+    } else {
+      // 여전히 실패 → 버전을 올리지 않아 다음 로드에 재시도. 사용자에게 공간 부족 안내.
+      console.error('[seed] 샘플 병합 저장 실패 — 저장 공간 부족 가능. 설정 > 데이터 초기화 후 재시도하세요.');
+      try { window.dispatchEvent(new CustomEvent('rbtl:persist-failed', { detail: { key: 'sample-seed' } })); } catch { /* 무시 */ }
+    }
   }
 }
 
@@ -192,7 +214,7 @@ function renderShell() {
     el('div', { class: 'row' }, menuBtn, title),
     el('div', { class: 'topbar-right' },
       serverMode ? el('span', { class: 'badge green', title: '중앙 게이트웨이 서버 모드' }, '서버 모드') : null,
-      el('span', { class: 'badge dim mono', title: '빌드 2026-07-05 · MCP 100종·DB전략·실시간테스트·분야별 벤치마크', style: { fontFamily: 'var(--font-mono)' } }, 'v2.0')));
+      el('span', { class: 'badge dim mono', title: '빌드 2026-07-05 · MCP 100종·DB전략·실시간테스트·분야별 벤치마크 (샘플 병합 v3)', style: { fontFamily: 'var(--font-mono)' } }, 'v2.1')));
 
   const content = el('div', { class: 'content' });
   const main = el('main', { class: 'main' }, topbar, content);
