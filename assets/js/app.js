@@ -53,6 +53,27 @@ function seed() {
   ensureArray('strategies', SAMPLE_STRATEGIES);
   ensureArray('benchmarks', SAMPLE_BENCHMARKS);
   ensureArray('runs', []);
+
+  // 샘플 버전 동기화: 앱이 업데이트되어 새 기본 샘플(MCP·전략·벤치마크)이 추가되면,
+  // 기존 사용자의 localStorage에도 신규 샘플(id가 아직 없는 것)만 1회 병합한다.
+  // 사용자가 만든 항목·수정 내용은 그대로 보존하며, 버전당 한 번만 실행되어
+  // 사용자가 삭제한 샘플을 매 로드마다 되살리지 않는다.
+  // (v2: MCP 30→100종, 벤치마크 1→11세트, DB 전략 샘플 추가)
+  const SAMPLE_VERSION = 2;
+  const seededVer = Number(store.get('sampleSeedVersion') || 0);
+  if (seededVer < SAMPLE_VERSION) {
+    const mergeSamples = (key, samples) => {
+      const cur = store.get(key);
+      if (!Array.isArray(cur) || !Array.isArray(samples)) return;
+      const ids = new Set(cur.map((x) => x && x.id));
+      const additions = samples.filter((s) => s && s.id && !ids.has(s.id));
+      if (additions.length) store.set(key, [...cur, ...additions]);
+    };
+    mergeSamples('mcps', SAMPLE_MCPS);
+    mergeSamples('strategies', SAMPLE_STRATEGIES);
+    mergeSamples('benchmarks', SAMPLE_BENCHMARKS);
+    store.set('sampleSeedVersion', SAMPLE_VERSION);
+  }
 }
 
 /* ---------- 내비게이션 정의 ---------- */
