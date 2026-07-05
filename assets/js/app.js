@@ -40,6 +40,10 @@ function currentIdentity() {
 }
 
 /* ---------- 초기 데이터 시드 (기대 타입이 아니면 방어적으로 재시드) ---------- */
+// 샘플 데이터 버전 — 이 값을 올리면 로컬(seed)과 게이트웨이(syncSamplesToGateway) 양쪽에서
+// 신규 기본 샘플이 기존 사용자/서버 저장소에 병합된다.
+const SAMPLE_VERSION = 3;
+
 function seed() {
   const settings = store.get('settings');
   if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
@@ -62,7 +66,6 @@ function seed() {
   // v3: 저장 성공을 검증하고 실패 시 버전을 올리지 않는다. store.set은 용량 초과 등
   //     실패 시 false를 반환하고 롤백하는데, 이전엔 이를 무시하고 버전을 기록해
   //     병합이 누락된 채 영구히 건너뛰던 고착 문제가 있었다. 버전을 올려 재병합을 유도.
-  const SAMPLE_VERSION = 3;
   const seededVer = Number(store.get('sampleSeedVersion') || 0);
   if (seededVer < SAMPLE_VERSION) {
     const mergeSamples = (key, samples) => {
@@ -214,7 +217,7 @@ function renderShell() {
     el('div', { class: 'row' }, menuBtn, title),
     el('div', { class: 'topbar-right' },
       serverMode ? el('span', { class: 'badge green', title: '중앙 게이트웨이 서버 모드' }, '서버 모드') : null,
-      el('span', { class: 'badge dim mono', title: '빌드 2026-07-05 · MCP 100종·DB전략·실시간테스트·분야별 벤치마크 (샘플 병합 v3)', style: { fontFamily: 'var(--font-mono)' } }, 'v2.1')));
+      el('span', { class: 'badge dim mono', title: '빌드 2026-07-05 · MCP 100종·DB전략·실시간테스트·분야별 벤치마크 (샘플 병합 v3, 게이트웨이 자동 병합)', style: { fontFamily: 'var(--font-mono)' } }, 'v2.2')));
 
   const content = el('div', { class: 'content' });
   const main = el('main', { class: 'main' }, topbar, content);
@@ -427,10 +430,39 @@ async function bootServer() {
   }
 }
 
+// 게이트웨이(서버) 모드 샘플 자동 병합:
+// 앱이 업데이트되어 새 기본 샘플(MCP·전략·벤치마크)이 추가되면, 게이트웨이 공유 저장소에도
+// 신규 샘플(id 미존재)을 병합해 서버로 push 한다. 게이트웨이별(gwSeed:<url>) SAMPLE_VERSION
+// 기준으로 1회만 수행 → 매 접속마다 삭제된 샘플을 되살리거나 불필요하게 push 하지 않는다.
+// 병합은 "추가"만 하므로 서버에 있던 사용자 데이터를 지우지 않는다(비파괴적). pullShared 직후
+// (startSharedSync 구독 활성 상태)에 호출되어야 store.set → 서버 push 가 동작한다.
+async function syncSamplesToGateway() {
+  if (!gateway.isServerMode()) return;
+  const url = gateway.getGatewayUrl() || '';
+  const gateKey = 'gwSeed:' + url;
+  if (Number(store.get(gateKey) || 0) >= SAMPLE_VERSION) return; // 이 게이트웨이엔 이미 반영됨
+  const specs = [['mcps', SAMPLE_MCPS], ['strategies', SAMPLE_STRATEGIES], ['benchmarks', SAMPLE_BENCHMARKS]];
+  let added = 0;
+  for (const [key, samples] of specs) {
+    const cur = store.get(key);
+    const base = Array.isArray(cur) ? cur : [];
+    const ids = new Set(base.map((x) => x && x.id));
+    const additions = samples.filter((s) => s && s.id && !ids.has(s.id));
+    added += additions.length;
+    // 항상 store.set → 구독자(startSharedSync)가 서버로 push. 서버가 해당 키(예: mcps)를
+    // 아직 갖고 있지 않아도 확실히 반영된다. 추가만 하므로 비파괴적.
+    store.set(key, additions.length ? [...base, ...additions] : base);
+  }
+  store.set(gateKey, SAMPLE_VERSION);
+  if (added > 0) toast(`새 기본 샘플 ${added}개를 서버에 반영했습니다. 다른 기기는 새로고침하면 보입니다.`, 'success', 6000);
+}
+
 // (d) 로그인 성공 → 공유 데이터 pull 후 셸 렌더
 async function enterServerShell() {
   try { await gateway.pullShared(); }
   catch { /* 초기 동기화 실패는 치명적이지 않음 — 로컬 시드로 진행 */ }
+  try { await syncSamplesToGateway(); }
+  catch { /* 샘플 자동 병합 실패는 치명적이지 않음 */ }
   renderShell();
   if (!location.hash || location.hash === '#') location.hash = '#/dashboard';
 }
