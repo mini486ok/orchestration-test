@@ -97,6 +97,72 @@ function scoreParams(expected, actualSteps) {
 }
 
 /* ============================================================
+   §6 신규 지표 헬퍼 (도구 성공률 / 목표 달성)
+   ============================================================ */
+
+/** 도구 호출 성공률 = (전체 - 실패)/전체. actual 0이면 null. 실패=해당 step.error 존재 */
+function computeCallSuccessRate(actualSteps) {
+  if (!actualSteps.length) return null;
+  const failed = actualSteps.filter((s) => s && s.error).length;
+  return (actualSteps.length - failed) / actualSteps.length;
+}
+
+/** 단일 목표 step 충족 여부: 같은 도구 id가 error 없이 호출 && (params 지정 시 매칭 ≥ 0.5) */
+function isStepAchieved(target, actualSteps) {
+  const targetId = toolId(target);
+  // 목표도구 id가 actual에 존재 && 해당 호출 error 없음
+  const matches = actualSteps.filter((s) => toolId(s) === targetId && !s.error);
+  if (!matches.length) return false;
+  // 목표 step에 params가 있으면, 성공 호출 중 하나라도 params 매칭 ≥ 0.5 여야 충족
+  const params = target.params;
+  if (params && typeof params === 'object' && Object.keys(params).length > 0) {
+    const keys = Object.keys(params);
+    for (const s of matches) {
+      const ap = s.params || {};
+      let matched = 0;
+      for (const k of keys) if (paramValEq(params[k], ap[k])) matched++;
+      if (matched / keys.length >= 0.5) return true;
+    }
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 목표 도구 달성 여부(1/0/null). null = 판정 대상 없음(N/A).
+ * 채택된 gold 시퀀스(adoptedGold: primary 또는 F1 최대로 채택된 대안)와 대안 채택 여부(isAlternative)로 목표 step 집합을 정한다.
+ *   - ordered===false 이고 goal 미지정 → 집합 완수 모드: adoptedGold 전체가 목표(순서 무의미한 대칭 병렬을 대칭 채점, 모두 충족 시 1).
+ *   - goal 유효 && (primary 채택 || goal 도구가 adoptedGold에 포함) → 목표=[goal].
+ *   - 그 외(대안 채택인데 goal이 그 대안에 없음 등) → 목표=[adoptedGold의 마지막 step].
+ *   - 목표가 비면(=expected 없음) → null.
+ * 각 목표 step 충족 조건: actual에 같은 도구 id 호출이 error 없이 존재 && (그 step에 params 있으면 paramMatch ≥ 0.5).
+ * 집합 모드는 모든 목표 step 충족 시 1, 단일 모드는 그 step 충족 시 1, 아니면 0.
+ */
+function computeGoalAchieved(goal, adoptedGold, actualSteps, { ordered = true, isAlternative = false } = {}) {
+  const gold = Array.isArray(adoptedGold) ? adoptedGold : [];
+  const goalValid = goal && (goal.serverId || goal.toolName);
+
+  // 목표 step 집합 결정
+  let targets;
+  if (ordered === false && !goalValid) {
+    targets = gold; // 집합 완수 모드(순서 무의미한 대칭 병렬)
+  } else if (goalValid && (!isAlternative || gold.some((s) => toolId(s) === toolId(goal)))) {
+    targets = [{ serverId: goal.serverId, toolName: goal.toolName, params: goal.params }];
+  } else if (gold.length) {
+    targets = [gold[gold.length - 1]];
+  } else {
+    targets = [];
+  }
+  if (!targets.length) return null; // 판정 대상 없음(expected/goal 없음) → N/A
+
+  // 집합 모드: 모든 목표 step 충족해야 1 / 단일 모드: 그 step 충족 시 1
+  for (const t of targets) {
+    if (!isStepAchieved(t, actualSteps)) return 0;
+  }
+  return 1;
+}
+
+/* ============================================================
    §8 scoreItem / summarize
    ============================================================ */
 
@@ -137,10 +203,14 @@ function scoreOne(exp, act, ordered) {
 /**
  * 단일 항목 채점.
  * @param {Array<{serverId,toolName,params?}>} expected 정답 워크플로우
- * @param {Array<{serverId,toolName,...}>} actualSteps 실행 결과 steps
- * @param {{ordered?:boolean, alternatives?:Array<Array>}} [opts]
+ * @param {Array<{serverId,toolName,error?,...}>} actualSteps 실행 결과 steps(각 step의 error 포함)
+ * @param {{ordered?:boolean, alternatives?:Array<Array>, goal?:{serverId,toolName,params?}}} [opts]
  *   ordered=false → 순서 무관 채점 · alternatives → 대안 정답들(각각 expected 형태) 중 f1 최대 채택
- * @returns {{precision,recall,f1,seqAccuracy,exactMatch,paramScore,matchedAlternative}}
+ *   goal → 목표 도구 명시(없으면 채택 gold 시퀀스로 결정, computeGoalAchieved 참조)
+ * @returns {{precision,recall,f1,seqAccuracy,exactMatch,paramScore,matchedAlternative,
+ *   callSuccessRate,extraToolRate,goalAchieved,compositeScore}}
+ *   goalAchieved 는 1/0/null(판정 대상 없음). compositeScore 는 null 지표를 제외하고 남은 가중치로 재정규화한 값.
+ *   (inputTokens/outputTokens/totalTokens/tokensEstimated 는 오케스트레이터 결과에서 호출측이 병합)
  */
 export function scoreItem(expected = [], actualSteps = [], opts = {}) {
   const act = Array.isArray(actualSteps) ? actualSteps : [];
@@ -149,6 +219,7 @@ export function scoreItem(expected = [], actualSteps = [], opts = {}) {
 
   let best = scoreOne(primary, act, ordered);
   best.matchedAlternative = null; // null = 본 정답(primary) 채택
+  let adoptedGold = primary;      // 목표 달성 판정에 쓸 "채택된 gold 시퀀스"
 
   const alts = Array.isArray(opts.alternatives) ? opts.alternatives : [];
   alts.forEach((alt, idx) => {
@@ -157,8 +228,30 @@ export function scoreItem(expected = [], actualSteps = [], opts = {}) {
     if (cand.f1 > best.f1) {
       cand.matchedAlternative = idx;
       best = cand;
+      adoptedGold = alt;
     }
   });
+
+  // §6 신규 지표 — 채택된(F1 최대) 후보 기준으로 일관되게 계산(대안 채택 시 그 대안 기준)
+  best.callSuccessRate = computeCallSuccessRate(act);
+  best.extraToolRate = act.length === 0 ? 0 : (1 - best.precision); // 잉여 도구 호출 비율(=1-정밀도)
+  best.goalAchieved = computeGoalAchieved(opts.goal, adoptedGold, act, {
+    ordered,
+    isAlternative: best.matchedAlternative != null,
+  });
+  // 품질 종합점수(토큰 무관, [0,1]): f1 0.4 · 목표달성 0.3 · 도구성공률 0.15 · 파라미터 0.15의 가중평균.
+  // N/A(null) 항목은 제외하고 남은 가중치로 재정규화(무호출/N/A 편향 제거). f1은 항상 존재.
+  const terms = [
+    { w: 0.4, v: best.f1 },
+    { w: 0.3, v: best.goalAchieved },
+    { w: 0.15, v: best.callSuccessRate },
+    { w: 0.15, v: best.paramScore },
+  ];
+  let sw = 0, acc = 0;
+  for (const t of terms) {
+    if (t.v != null) { sw += t.w; acc += t.w * t.v; }
+  }
+  best.compositeScore = sw > 0 ? acc / sw : 0;
 
   return best;
 }
@@ -175,9 +268,14 @@ export function summarize(items = []) {
       avgPrecision: 0, avgRecall: 0, avgF1: 0, avgSeqAccuracy: 0,
       exactMatchRate: 0, avgParamScore: null, avgLatencyMs: 0, avgLlmCalls: 0,
       errorRate: 0, hardErrorRate: 0, fallbackRate: 0, avgF1Matched: null, itemCount: 0,
+      // §6 신규
+      avgCallSuccessRate: null, avgExtraToolRate: 0, goalAchievementRate: null,
+      avgInputTokens: 0, avgOutputTokens: 0, avgTotalTokens: 0, totalTokens: 0,
+      anyTokensEstimated: false, avgComposite: 0,
     };
   }
   const mean = (fn) => items.reduce((s, it) => s + (Number(fn(it)) || 0), 0) / n;
+  const sum = (fn) => items.reduce((s, it) => s + (Number(fn(it)) || 0), 0);
   const paramItems = items.filter((it) => it.metrics && it.metrics.paramScore != null);
   const avgParamScore = paramItems.length
     ? paramItems.reduce((s, it) => s + it.metrics.paramScore, 0) / paramItems.length
@@ -186,6 +284,16 @@ export function summarize(items = []) {
   const matchedItems = items.filter((it) => !it.usedFallback);
   const avgF1Matched = matchedItems.length
     ? matchedItems.reduce((s, it) => s + (Number(it.metrics?.f1) || 0), 0) / matchedItems.length
+    : null;
+  // 도구 성공률: actual 0(호출 없음) 항목은 null이므로 평균에서 제외
+  const csrItems = items.filter((it) => it.metrics && it.metrics.callSuccessRate != null);
+  const avgCallSuccessRate = csrItems.length
+    ? csrItems.reduce((s, it) => s + it.metrics.callSuccessRate, 0) / csrItems.length
+    : null;
+  // 목표 달성률: goalAchieved가 null(N/A)인 항목은 평균에서 제외(avgCallSuccessRate와 동일 정책)
+  const goalItems = items.filter((it) => it.metrics && it.metrics.goalAchieved != null);
+  const goalAchievementRate = goalItems.length
+    ? goalItems.reduce((s, it) => s + it.metrics.goalAchieved, 0) / goalItems.length
     : null;
 
   return {
@@ -204,6 +312,16 @@ export function summarize(items = []) {
     fallbackRate: mean((it) => (it.usedFallback ? 1 : 0)),
     avgF1Matched,
     itemCount: n,
+    // §6 신규 요약 지표
+    avgCallSuccessRate,
+    avgExtraToolRate: mean((it) => it.metrics?.extraToolRate),
+    goalAchievementRate,
+    avgInputTokens: mean((it) => it.metrics?.inputTokens),
+    avgOutputTokens: mean((it) => it.metrics?.outputTokens),
+    avgTotalTokens: mean((it) => it.metrics?.totalTokens),
+    totalTokens: sum((it) => it.metrics?.totalTokens),
+    anyTokensEstimated: items.some((it) => it.metrics && it.metrics.tokensEstimated),
+    avgComposite: mean((it) => it.metrics?.compositeScore),
   };
 }
 
@@ -302,6 +420,7 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
 
       let actual = [], trace = [], llmCalls = 0, latencyMs = 0, error, finalAnswer;
       let hasStepErrors = false, usedFallback = false;
+      let inputTokens = 0, outputTokens = 0, tokensEstimated = false;
       try {
         const res = await executeStrategy(effStrategy, item.query, { mcps, signal });
         actual = res?.steps || [];
@@ -311,6 +430,10 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
         finalAnswer = res?.finalAnswer;
         hasStepErrors = !!(res?.hasStepErrors || actual.some((s) => s && s.error));
         usedFallback = !!res?.usedFallback;
+        // 토큰 계측(오케스트레이터 result에서). scoreItem은 토큰을 모르므로 여기서 metrics에 병합한다.
+        inputTokens = res?.inputTokens || 0;
+        outputTokens = res?.outputTokens || 0;
+        tokensEstimated = !!res?.tokensEstimated;
         if (res && res.ok === false && res.error) error = res.error;
       } catch (e) {
         if (signal?.aborted || e?.name === 'AbortError') { cancelled = true; break; }
@@ -318,7 +441,17 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
         actual = []; // 실패 항목은 actual=[]로 채점
       }
 
-      const metrics = scoreItem(item.expected || [], actual, { ordered: item.ordered, alternatives: item.alternatives });
+      // actual step의 error를 보존한 채로 채점(도구 성공률·목표 달성 판정에 필요).
+      const metrics = scoreItem(item.expected || [], actual, {
+        ordered: item.ordered,
+        alternatives: item.alternatives,
+        goal: item.goal,
+      });
+      // §6 토큰 지표를 metrics에 기록
+      metrics.inputTokens = inputTokens;
+      metrics.outputTokens = outputTokens;
+      metrics.totalTokens = inputTokens + outputTokens;
+      metrics.tokensEstimated = tokensEstimated;
       perItems.push({
         itemId: item.id,
         query: item.query,
@@ -350,5 +483,35 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
   }
 
   run.status = cancelled ? 'cancelled' : 'done';
+  // 전략 간 상대 정규화(토큰효율)와 헤드라인 종합점수를 각 perStrategy.summary에 주입.
+  finalizeScores(run);
+  return run;
+}
+
+/**
+ * run 레벨 후처리 — 전략 간 avgTotalTokens를 "가장 적은 전략 대비 비율"로 환산해 각 perStrategy.summary에
+ * `tokenEfficiency`(minPos/avg, [0,1]; 토큰 0 전략·단일/동일 전략이면 1)와
+ * `orchestrationScore`(0.85·avgComposite + 0.15·tokenEfficiency)를 주입한다.
+ * (min-max 대신 비율 기반 — 이상치가 나머지를 0으로 뭉개지 않고 소폭 차이는 1에 근접. 여러 전략을 함께 평가할 때만 상대적이므로 runEvaluation 종료 후 호출)
+ * @param {object} run EvalRun (perStrategy.*.summary 를 in-place 갱신)
+ * @returns {object} run
+ */
+export function finalizeScores(run) {
+  const strategies = (run && run.perStrategy) ? Object.values(run.perStrategy) : [];
+  if (!strategies.length) return run;
+
+  // 양수 토큰 전략들 중 최소값(minPos)을 기준으로 비율화. 토큰 정보가 없으면 minPos=0.
+  const avgs = strategies.map((s) => Number(s.summary?.avgTotalTokens) || 0);
+  const pos = avgs.filter((x) => x > 0);
+  const minPos = pos.length ? Math.min(...pos) : 0;
+
+  for (const s of strategies) {
+    const summary = s.summary || (s.summary = {});
+    const a = Number(summary.avgTotalTokens) || 0;
+    // 토큰 0(계측 없음) 전략은 1, 그 외에는 최소 전략 대비 비율(단일/동일 전략이면 자기 자신이 최소 → 1)
+    const eff = a <= 0 ? 1 : (minPos > 0 ? Math.max(0, Math.min(1, minPos / a)) : 1);
+    summary.tokenEfficiency = eff;
+    summary.orchestrationScore = 0.85 * (Number(summary.avgComposite) || 0) + 0.15 * eff;
+  }
   return run;
 }

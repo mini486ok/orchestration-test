@@ -15,6 +15,18 @@
 //  sample-benchmark-basic  기본 검증 세트 (항목 10개, easy 4 / medium 4 / hard 2)
 // ============================================================================
 
+// v2 확장: 분야별 검증 세트 10종(각 10문항)을 별도 모듈에서 병합 → 기본 1 + 10 = 11세트
+import { BENCH_OPERATIONS } from './benchmarksExt/operations.js';
+import { BENCH_BOOKING } from './benchmarksExt/booking.js';
+import { BENCH_SAFETY } from './benchmarksExt/safety.js';
+import { BENCH_FACILITY } from './benchmarksExt/facility.js';
+import { BENCH_FREIGHT } from './benchmarksExt/freight.js';
+import { BENCH_URBAN } from './benchmarksExt/urban.js';
+import { BENCH_PASSENGER } from './benchmarksExt/passenger.js';
+import { BENCH_WEATHER } from './benchmarksExt/weather.js';
+import { BENCH_ANALYTICS } from './benchmarksExt/analytics.js';
+import { BENCH_FARE } from './benchmarksExt/fare.js';
+
 export const SAMPLE_STRATEGIES = [
   // --------------------------------------------------------------------------
   // 1. 프롬프트 기반 — 플랜 우선(plan)
@@ -416,7 +428,7 @@ export const SAMPLE_STRATEGIES = [
   }
 ];
 
-export const SAMPLE_BENCHMARKS = [
+const BASE_BENCHMARKS = [
   {
     id: 'sample-benchmark-basic',
     name: '기본 검증 세트',
@@ -540,4 +552,11 @@ export const SAMPLE_BENCHMARKS = [
       }
     ]
   }
+];
+
+// ── v2: 기본 검증 세트 1종 + 분야별 검증 세트 10종 = 총 11세트 병합 ──
+export const SAMPLE_BENCHMARKS = [
+  ...BASE_BENCHMARKS,
+  BENCH_OPERATIONS, BENCH_BOOKING, BENCH_SAFETY, BENCH_FACILITY, BENCH_FREIGHT,
+  BENCH_URBAN, BENCH_PASSENGER, BENCH_WEATHER, BENCH_ANALYTICS, BENCH_FARE,
 ];

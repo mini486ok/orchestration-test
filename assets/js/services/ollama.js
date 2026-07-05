@@ -116,9 +116,36 @@ export async function listModels({ embedding = false } = {}) {
 }
 
 /**
+ * 응답 JSON에서 토큰 계측을 추출한다.
+ * - Ollama 원본이 prompt_eval_count(입력)·eval_count(출력)를 주면 실측값 사용(tokensEstimated:false).
+ * - 하나라도 없으면 문자수/2.2(한글 혼합 텍스트 기준 근사)로 추정하고 tokensEstimated:true.
+ * @param {object} data 응답 JSON
+ * @param {Array} messages 요청 messages(입력 문자수 추정용)
+ * @param {string} content 응답 content(출력 문자수 추정용)
+ * @returns {{promptTokens:number, outputTokens:number, tokensEstimated:boolean}}
+ */
+function extractTokens(data, messages, content) {
+  const pe = data?.prompt_eval_count;
+  const ec = data?.eval_count;
+  const havePrompt = Number.isFinite(pe);
+  const haveOutput = Number.isFinite(ec);
+  if (havePrompt && haveOutput) {
+    return { promptTokens: pe, outputTokens: ec, tokensEstimated: false };
+  }
+  // 하나라도 실측이 없으면 추정으로 채운다(있는 값은 실측 유지). 하나라도 추정이면 estimated=true.
+  const inChars = (messages || []).reduce((s, m) => s + (m?.content?.length || 0), 0);
+  const outChars = (content || '').length;
+  return {
+    promptTokens: havePrompt ? pe : Math.round(inChars / 2.2),
+    outputTokens: haveOutput ? ec : Math.round(outChars / 2.2),
+    tokensEstimated: true,
+  };
+}
+
+/**
  * 채팅 완성 호출 (stream: false)
  * @param {{model?, messages, temperature?, format?, signal?}} opts
- * @returns {Promise<{content, durationMs, model}>}
+ * @returns {Promise<{content, durationMs, model, promptTokens, outputTokens, tokensEstimated}>}
  */
 export async function chat({ model, messages, temperature = 0.2, format, signal } = {}) {
   const useModel = model || getDefaultModel();
@@ -153,10 +180,13 @@ export async function chat({ model, messages, temperature = 0.2, format, signal 
     throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
   }
   const data = await res.json();
+  const content = data.message?.content ?? '';
+  const tok = extractTokens(data, messages, content);
   return {
-    content: data.message?.content ?? '',
+    content,
     durationMs: performance.now() - t0,
     model: useModel,
+    ...tok,
   };
 }
 
@@ -185,10 +215,14 @@ async function chatViaGateway(body, useModel, t0, signal) {
     throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
   }
   const data = await res.json();
+  const content = data.message?.content ?? '';
+  // 게이트웨이는 Ollama 원본 JSON(prompt_eval_count/eval_count 포함)을 그대로 통과시킨다.
+  const tok = extractTokens(data, body?.messages, content);
   return {
-    content: data.message?.content ?? '',
+    content,
     durationMs: performance.now() - t0,
     model: useModel,
+    ...tok,
   };
 }
 
@@ -298,7 +332,9 @@ export function extractJSON(text) {
 
 /**
  * JSON 응답을 기대하는 호출 — 실패 시 1회 재시도(형식 교정 요청)
- * @returns {Promise<{data, raw, durationMs, retried, calls}>} calls: 실제 LLM 호출 횟수(1 또는 2)
+ * @returns {Promise<{data, raw, durationMs, retried, calls, promptTokens, outputTokens, tokensEstimated}>}
+ *   calls: 실제 LLM 호출 횟수(1 또는 2). promptTokens/outputTokens: 내부 chat 호출 합산.
+ *   tokensEstimated: 내부 호출 중 하나라도 추정이면 true.
  */
 export async function chatJSON({ model, messages, temperature = 0.1, signal } = {}) {
   // 실패 시에도 시도한 호출 수를 오류 객체에 실어(e.llmCalls) 호출측이 집계할 수 있게 한다
@@ -306,11 +342,19 @@ export async function chatJSON({ model, messages, temperature = 0.1, signal } = 
   try {
     first = await chat({ model, messages, temperature, format: 'json', signal });
   } catch (e) {
-    if (e && typeof e === 'object') e.llmCalls = 1;
+    // 첫 호출 자체가 실패(연결/HTTP)하면 처리된 토큰이 없으므로 0으로 실어 보낸다.
+    if (e && typeof e === 'object') { e.llmCalls = 1; e.promptTokens = 0; e.outputTokens = 0; e.tokensEstimated = false; }
     throw e;
   }
   let data = extractJSON(first.content);
-  if (data !== undefined) return { data, raw: first.content, durationMs: first.durationMs, retried: false, calls: 1 };
+  if (data !== undefined) {
+    return {
+      data, raw: first.content, durationMs: first.durationMs, retried: false, calls: 1,
+      promptTokens: first.promptTokens || 0,
+      outputTokens: first.outputTokens || 0,
+      tokensEstimated: !!first.tokensEstimated,
+    };
+  }
 
   // 재시도: 이전 응답을 보여주고 JSON만 요구
   const retryMessages = [
@@ -322,7 +366,13 @@ export async function chatJSON({ model, messages, temperature = 0.1, signal } = 
   try {
     second = await chat({ model, messages: retryMessages, temperature: 0, format: 'json', signal });
   } catch (e) {
-    if (e && typeof e === 'object') e.llmCalls = 2;
+    // 재시도 호출 실패: 첫 호출은 성공했으므로 그 누적 토큰을 실어 보낸다(과소기록 방지).
+    if (e && typeof e === 'object') {
+      e.llmCalls = 2;
+      e.promptTokens = first.promptTokens || 0;
+      e.outputTokens = first.outputTokens || 0;
+      e.tokensEstimated = !!first.tokensEstimated;
+    }
     throw e;
   }
   data = extractJSON(second.content);
@@ -330,7 +380,16 @@ export async function chatJSON({ model, messages, temperature = 0.1, signal } = 
     const preview = (second.content || '').slice(0, 200);
     const err = new Error('LLM이 유효한 JSON을 반환하지 않았습니다: ' + preview);
     err.llmCalls = 2;
+    // 파싱 실패지만 두 호출 모두 실제로 이뤄졌으므로 합산 토큰을 실어 보낸다(과소기록 방지).
+    err.promptTokens = (first.promptTokens || 0) + (second.promptTokens || 0);
+    err.outputTokens = (first.outputTokens || 0) + (second.outputTokens || 0);
+    err.tokensEstimated = !!first.tokensEstimated || !!second.tokensEstimated;
     throw err;
   }
-  return { data, raw: second.content, durationMs: first.durationMs + second.durationMs, retried: true, calls: 2 };
+  return {
+    data, raw: second.content, durationMs: first.durationMs + second.durationMs, retried: true, calls: 2,
+    promptTokens: (first.promptTokens || 0) + (second.promptTokens || 0),
+    outputTokens: (first.outputTokens || 0) + (second.outputTokens || 0),
+    tokensEstimated: !!first.tokensEstimated || !!second.tokensEstimated,
+  };
 }

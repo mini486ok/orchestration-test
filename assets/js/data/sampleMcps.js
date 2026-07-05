@@ -18,7 +18,19 @@
 // mock 샘플 포함 도구: 30개 (각 서버 대표 도구 1개씩, 전체의 1/3)
 // ============================================================================
 
-export const SAMPLE_MCPS = [
+// v2 확장: 분야별 신규 서버 70종(각 분야 +7)을 별도 모듈에서 병합 → 총 100종
+import { MCPS_OPERATIONS } from './mcpsExt/operations.js';
+import { MCPS_BOOKING } from './mcpsExt/booking.js';
+import { MCPS_SAFETY } from './mcpsExt/safety.js';
+import { MCPS_FACILITY } from './mcpsExt/facility.js';
+import { MCPS_FREIGHT } from './mcpsExt/freight.js';
+import { MCPS_URBAN } from './mcpsExt/urban.js';
+import { MCPS_PASSENGER } from './mcpsExt/passenger.js';
+import { MCPS_WEATHER } from './mcpsExt/weather.js';
+import { MCPS_ANALYTICS } from './mcpsExt/analytics.js';
+import { MCPS_FARE } from './mcpsExt/fare.js';
+
+const BASE_MCPS = [
   // ==========================================================================
   // 1. 운행정보 (運行情報)
   // ==========================================================================
@@ -3256,4 +3268,11 @@ export const SAMPLE_MCPS = [
       }
     ]
   }
+];
+
+// ── v2: 기본 30종 + 분야별 신규 70종 = 총 100종 병합 ──
+export const SAMPLE_MCPS = [
+  ...BASE_MCPS,
+  ...MCPS_OPERATIONS, ...MCPS_BOOKING, ...MCPS_SAFETY, ...MCPS_FACILITY, ...MCPS_FREIGHT,
+  ...MCPS_URBAN, ...MCPS_PASSENGER, ...MCPS_WEATHER, ...MCPS_ANALYTICS, ...MCPS_FARE,
 ];

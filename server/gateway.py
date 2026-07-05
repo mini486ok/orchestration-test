@@ -921,6 +921,8 @@ class Handler(BaseHTTPRequestHandler):
             save_accounts(accounts)
 
         # Ollama 호출 (락 밖 — 느린 I/O). 성공/실패 무관 쿼터는 이미 소모됨.
+        # stream=False 로 단일 JSON 응답을 받고, 그 원본 바이트를 _send_raw 로 그대로 통과시킨다.
+        # (토큰 계측: Ollama 원본의 prompt_eval_count/eval_count 를 스트리핑 없이 클라이언트로 전달)
         body["stream"] = False
         try:
             payload = json.dumps(body).encode("utf-8")
@@ -931,6 +933,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "LLM 서버(Ollama)에 연결할 수 없습니다."},
                 {"X-Quota-Remaining": str(remaining_after)},
             )
+        # raw 를 파싱/가공하지 않고 그대로 전달 → prompt_eval_count/eval_count 등 계측 필드 보존.
         self._send_raw(status, raw, {"X-Quota-Remaining": str(remaining_after)})
 
     def _h_embed(self, body):

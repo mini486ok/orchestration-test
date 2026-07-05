@@ -2,12 +2,16 @@
 // catalogIndex.js — MCP 도구 카탈로그의 검색 기반 공급(retrieval) 엔진
 // SPEC-GATEWAY §4 계약 구현. 순수 ES module.
 //
-//  buildIndex({mcps, embedModel, onProgress})  도구 단위 문서 임베딩 → store 'catalogIndex'
-//  indexStatus(mcps)                            인덱스 존재/stale/도구수/모델/구축시각
-//  retrieve(query, {mcps, ...retrieval파라미터}) vector·keyword·hybrid 검색 + 확장
+//  buildIndex({mcps, embedModel, docFields, onProgress})  도구 단위 문서 임베딩 → store 'catalogIndex'
+//  indexStatus(mcps, embedModel, docFields)               인덱스 존재/stale/도구수/모델/구축시각
+//  retrieve(query, {mcps, ...retrieval파라미터, docFields, mmrLambda}) vector·keyword·hybrid 검색 + 확장
+//
+// v2(§2): 청킹 없음(도구당 1벡터 유지). 대신 임베딩 문서 구성 토글(docFields) + MMR 다양성(mmrLambda) 추가.
+//   docFields={desc,params,outputs,examples,tags} 기본 {desc,params}만 켜 현행과 100% 동일 출력.
+//   mmrLambda 1.0(기본)=순수 관련도(현행), <1.0이면 검색 결과를 MMR로 재랭킹(문서 벡터 재사용).
 //
 // 저장 형태(store 'catalogIndex'):
-//  { builtAt, embedModel, dim, docs: [{ serverId, toolName, text, vec(소수4자리) }], mcpsFingerprint }
+//  { builtAt, embedModel, dim, docs: [{ serverId, toolName, text, vec(소수4자리) }], docFields, mcpsFingerprint }
 //
 // 검색 결과(retrieve 반환):
 //  { results: [{ serverId, toolName, score, source }], usedMethod, requestedMethod,
@@ -27,29 +31,75 @@ const BM25_B = 0.75;
    문서 텍스트 · 도구 평탄화
    ============================================================ */
 
-/** 도구 1개의 임베딩/토큰화 대상 문서 텍스트 — 서버명/설명 + 도구명/설명 + 파라미터명·설명 */
-function toolDocText(server, tool) {
+/** 임베딩 문서 구성 토글 기본값(§2) — 현행과 동일한 출력을 위해 desc+params만 켠다. */
+export const DEFAULT_DOC_FIELDS = { desc: true, params: true, outputs: false, examples: false, tags: false };
+
+/** examples/mock 샘플 등 임의 구조에서 스칼라 값을 재귀 수집(문자열화). 배열/객체는 내려가며 값만 모은다. */
+function pushScalars(v, out) {
+  if (v === null || v === undefined) return;
+  if (Array.isArray(v)) { for (const x of v) pushScalars(x, out); return; }
+  if (typeof v === 'object') { for (const x of Object.values(v)) pushScalars(x, out); return; }
+  out.push(String(v));
+}
+
+/**
+ * 도구 1개의 임베딩/토큰화 대상 문서 텍스트(§2). docFields 토글로 포함 요소를 조절한다.
+ * 식별자(서버명·도구명)는 항상 포함하고 나머지는 토글한다:
+ *   desc=서버/도구 설명, params=입력 파라미터명·설명, outputs=출력 스키마 키·설명,
+ *   examples=파라미터 examples/mock 샘플 값 텍스트, tags=서버 tags.
+ * 기본값(desc+params)이면 종전 출력과 100% 동일하다.
+ */
+function toolDocText(server, tool, docFields) {
+  const f = { ...DEFAULT_DOC_FIELDS, ...(docFields || {}) };
   const parts = [];
+  // 식별자(항상 포함)
   parts.push(server.nameKo || server.name || server.id || '');
   if (server.name && server.name !== server.nameKo) parts.push(server.name);
-  if (server.description) parts.push(server.description);
+  // desc: 서버 설명
+  if (f.desc && server.description) parts.push(server.description);
   parts.push(tool.name || '');
-  if (tool.description) parts.push(tool.description);
-  const props = tool.inputSchema?.properties || {};
-  for (const [n, p] of Object.entries(props)) {
-    parts.push(p && p.description ? `${n} ${p.description}` : n);
+  // desc: 도구 설명
+  if (f.desc && tool.description) parts.push(tool.description);
+  // params: 입력 파라미터명·설명
+  if (f.params) {
+    const props = tool.inputSchema?.properties || {};
+    for (const [n, p] of Object.entries(props)) {
+      parts.push(p && p.description ? `${n} ${p.description}` : n);
+    }
+  }
+  // outputs: 출력 스키마 키·설명
+  if (f.outputs) {
+    const props = tool.outputSchema?.properties || {};
+    for (const [n, p] of Object.entries(props)) {
+      parts.push(p && p.description ? `${n} ${p.description}` : n);
+    }
+  }
+  // examples: 파라미터 examples + mock 샘플 값
+  if (f.examples) {
+    const exs = [];
+    const props = tool.inputSchema?.properties || {};
+    for (const p of Object.values(props)) {
+      if (p && Array.isArray(p.examples)) for (const ex of p.examples) pushScalars(ex, exs);
+    }
+    if (Array.isArray(tool.mock?.samples)) for (const s of tool.mock.samples) pushScalars(s, exs);
+    if (exs.length) parts.push(exs.join(' '));
+  }
+  // tags: 서버 tags
+  if (f.tags && Array.isArray(server.tags) && server.tags.length) {
+    parts.push(server.tags.filter(Boolean).join(' '));
   }
   return parts.filter(Boolean).join('\n');
 }
 
-/** 등록된 모든 서버의 도구를 [{serverId, toolName, category, text}] 로 평탄화(등록 순서 보존) */
-function flattenTools(mcps) {
+/** 등록된 모든 서버의 도구를 [{serverId, toolName, category, text}] 로 평탄화(등록 순서 보존).
+ *  docFields 미지정 시 기본값(desc+params)으로 종전과 동일한 텍스트를 만든다. */
+function flattenTools(mcps, docFields) {
   const out = [];
   for (const srv of mcps || []) {
     if (!srv || !srv.id) continue;
     for (const tool of srv.tools || []) {
       if (!tool || !tool.name) continue;
-      out.push({ serverId: srv.id, toolName: tool.name, category: srv.category || '', text: toolDocText(srv, tool) });
+      out.push({ serverId: srv.id, toolName: tool.name, category: srv.category || '', text: toolDocText(srv, tool, docFields) });
     }
   }
   return out;
@@ -70,13 +120,16 @@ function hashStr(s) {
  * 포함)와 카테고리, 그리고 embedModel을 함께 해시한다. 따라서 도구 추가/삭제/개명뿐 아니라
  * 설명·파라미터·카테고리·임베딩 모델이 바뀌어도 값이 달라져 stale로 감지된다.
  * 구분자는 도구 설명 등에 등장할 가능성이 사실상 없는 제어문자(U+0001/U+0002)를 사용한다.
+ * docFields는 flattenTools가 만드는 문서 텍스트를 바꾸므로, 문서 구성이 바뀌면 해시가 달라져 stale로 잡힌다.
+ * (docFields 미지정 시 기본값=현행이라 해시가 종전과 100% 동일 → 회귀·불필요 재색인 없음.)
  * @param {Array} mcps
  * @param {string} [embedModel]
+ * @param {object} [docFields] 임베딩 문서 구성 토글(미지정 시 기본값 desc+params)
  */
-export function fingerprint(mcps, embedModel) {
+export function fingerprint(mcps, embedModel, docFields) {
   const SEP = '\u0001'; // 필드 구분자
   const REC = '\u0002'; // 레코드 구분자
-  const keys = flattenTools(mcps).map(
+  const keys = flattenTools(mcps, docFields).map(
     t => `${t.serverId}${SEP}${t.toolName}${SEP}${t.category}${SEP}${t.text}`,
   );
   keys.sort();
@@ -165,17 +218,59 @@ function minmax(vals) {
   return vals.map(v => (v - mn) / range);
 }
 
+/**
+ * MMR(Maximal Marginal Relevance) 재랭킹(§2) — 관련도와 다양성을 λ로 절충한다.
+ * 각 단계에서 score = λ·rel(q,d) − (1−λ)·max_{s∈선택} cos(d, s) 가 최대인 후보를 탐욕적으로 선택한다.
+ * 문서 벡터(doc.vec)를 재사용하며 추가 임베딩은 하지 않는다. 벡터가 없는 후보는 다양성 항이 0이 되어
+ * 관련도만으로 평가되므로, 벡터가 전혀 없으면 결과는 관련도 순서와 동일해진다(회귀 안전).
+ * 탐욕 선택 특성상 선택 순서가 곧 score 내림차순이다.
+ * @param {Array<{serverId,toolName,score}>} cands 관련도(score) 내림차순 후보
+ * @param {Map<string, number[]>} vecByKey 'serverId/toolName' → 벡터
+ * @param {number} lambda 0~1 (1=관련도만, 0=다양성 최대)
+ * @param {number} k 선택 개수
+ * @returns {Array<{serverId,toolName,score}>} MMR score로 재정렬된 상위 k
+ */
+function mmrRerank(cands, vecByKey, lambda, k) {
+  const lam = Math.min(1, Math.max(0, lambda));
+  const pool = cands.map(c => ({
+    serverId: c.serverId, toolName: c.toolName, rel: c.score,
+    vec: vecByKey.get(`${c.serverId}/${c.toolName}`) || null,
+  }));
+  const selected = [];
+  while (selected.length < k && pool.length) {
+    let bestI = 0, bestScore = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      const c = pool[i];
+      let maxSim = 0;
+      if (c.vec && c.vec.length) {
+        for (const s of selected) {
+          if (!s.vec || !s.vec.length) continue;
+          const sim = cosine(c.vec, s.vec);
+          if (sim > maxSim) maxSim = sim;
+        }
+      }
+      const mmr = lam * c.rel - (1 - lam) * maxSim;
+      if (mmr > bestScore) { bestScore = mmr; bestI = i; }
+    }
+    const [chosen] = pool.splice(bestI, 1);
+    selected.push({ serverId: chosen.serverId, toolName: chosen.toolName, vec: chosen.vec, score: bestScore });
+  }
+  return selected.map(s => ({ serverId: s.serverId, toolName: s.toolName, score: s.score }));
+}
+
 /* ============================================================
    인덱스 구축 / 상태
    ============================================================ */
 
 /**
  * 도구 단위 문서를 임베딩해 store 'catalogIndex'에 저장.
- * @param {{mcps:Array, embedModel?:string, onProgress?:({done,total})=>void, signal?:AbortSignal}} opts
+ * @param {{mcps:Array, embedModel?:string, docFields?:object,
+ *          onProgress?:({done,total})=>void, signal?:AbortSignal}} opts
+ *   docFields 미지정 시 기본값(desc+params) → 종전과 동일한 문서로 임베딩(회귀 없음). §2: 청킹 없음(도구당 1벡터).
  * @returns {Promise<object>} indexStatus 결과
  */
-export async function buildIndex({ mcps = [], embedModel = 'bge-m3:latest', onProgress, signal } = {}) {
-  const tools = flattenTools(mcps);
+export async function buildIndex({ mcps = [], embedModel = 'bge-m3:latest', docFields, onProgress, signal } = {}) {
+  const tools = flattenTools(mcps, docFields);
   const total = tools.length;
   if (!total) throw new Error('임베딩할 도구가 없습니다. MCP를 먼저 등록하세요.');
 
@@ -208,7 +303,8 @@ export async function buildIndex({ mcps = [], embedModel = 'bge-m3:latest', onPr
     embedModel,
     dim,
     docs,
-    mcpsFingerprint: fingerprint(mcps, embedModel),
+    docFields: { ...DEFAULT_DOC_FIELDS, ...(docFields || {}) }, // 재색인 판정용 — 문서 구성 토글 스냅샷
+    mcpsFingerprint: fingerprint(mcps, embedModel, docFields),
   };
   if (!store.set(INDEX_KEY, index)) {
     throw new Error('인덱스 저장 실패 — localStorage 용량 한계(약 5MB)를 초과했을 수 있습니다.');
@@ -221,15 +317,18 @@ export async function buildIndex({ mcps = [], embedModel = 'bge-m3:latest', onPr
  * @param {Array} mcps
  * @param {string} [embedModel] 비교 기준 임베딩 모델. 생략 시 인덱스가 구축된 모델을 사용해
  *   도구 설명/파라미터/카테고리 변경만으로 stale을 판정하고, 명시하면 모델 변경도 stale로 잡는다.
+ * @param {object} [docFields] 현재 문서 구성 토글. 생략 시 인덱스가 구축된 docFields로 비교해
+ *   문서 구성 변경만으로 stale이 되지 않게 하고, 명시하면 문서 구성 변경도 stale로 잡는다.
  */
-export function indexStatus(mcps = [], embedModel) {
+export function indexStatus(mcps = [], embedModel, docFields) {
   const idx = store.get(INDEX_KEY);
   if (!idx || !Array.isArray(idx.docs) || !idx.docs.length) {
     return { exists: false, stale: false, builtAt: null, docCount: 0, embedModel: null, dim: 0 };
   }
+  const df = docFields !== undefined ? docFields : idx.docFields;
   return {
     exists: true,
-    stale: idx.mcpsFingerprint !== fingerprint(mcps, embedModel || idx.embedModel),
+    stale: idx.mcpsFingerprint !== fingerprint(mcps, embedModel || idx.embedModel, df),
     builtAt: idx.builtAt || null,
     docCount: idx.docs.length,
     embedModel: idx.embedModel || null,
@@ -301,24 +400,27 @@ function expand(matches, mcps, { expandServer, expandCategory }) {
  * @param {string} query
  * @param {{mcps:Array, method?:'vector'|'keyword'|'hybrid', topK?:number, threshold?:number,
  *          hybridAlpha?:number, expandServer?:boolean, expandCategory?:boolean,
- *          embedModel?:string, signal?:AbortSignal}} opts
+ *          embedModel?:string, docFields?:object, mmrLambda?:number, signal?:AbortSignal}} opts
+ *   docFields: 문서 구성 토글(stale 판정·키워드 코퍼스에 사용, 미지정 시 인덱스 구축값/기본값).
+ *   mmrLambda: 1.0(기본)=순수 관련도(현행), <1.0이면 MMR 재랭킹으로 다양성 확보(문서 벡터 재사용, 추가 임베딩 없음).
  * @returns {Promise<{results:Array, usedMethod:string, requestedMethod:string,
  *          fallbackReason:string|null, topK:number, threshold:number}>}
  */
 export async function retrieve(query, {
   mcps = [], method = 'hybrid', topK = 8, threshold = 0,
   hybridAlpha = 0.5, expandServer = true, expandCategory = false,
-  embedModel = 'bge-m3:latest', signal,
+  embedModel = 'bge-m3:latest', docFields, mmrLambda = 1, signal,
 } = {}) {
   const q = String(query || '').trim();
   const k = Math.max(1, Math.floor(topK) || 8);
-  const currentTools = flattenTools(mcps);
+  const currentTools = flattenTools(mcps, docFields);
   const keyToIndex = new Map(currentTools.map((t, i) => [`${t.serverId}/${t.toolName}`, i]));
 
   const idx = store.get(INDEX_KEY);
   const idxExists = !!(idx && Array.isArray(idx.docs) && idx.docs.length);
-  // 콘텐츠 stale은 인덱스가 구축된 모델 기준으로 판정 — embedModel 불일치는 아래에서 별도 사유로 처리
-  const idxStale = idxExists && idx.mcpsFingerprint !== fingerprint(mcps, idx.embedModel);
+  // 콘텐츠 stale은 인덱스가 구축된 모델 기준으로 판정 — embedModel 불일치는 아래에서 별도 사유로 처리.
+  // docFields는 현재 config값(미지정 시 인덱스 구축값)으로 비교해 문서 구성 변경 시 stale→키워드 폴백.
+  const idxStale = idxExists && idx.mcpsFingerprint !== fingerprint(mcps, idx.embedModel, docFields !== undefined ? docFields : idx.docFields);
   const idxDim = idxExists ? (idx.dim || idx.docs[0]?.vec?.length || 0) : 0;
 
   // vector/hybrid는 임베딩 인덱스를 요구 — 없음/stale/모델 불일치면 keyword로 폴백
@@ -384,12 +486,22 @@ export async function retrieve(query, {
     }
   }
 
-  // threshold 필터 → 점수 내림차순 → topK
-  let matches = scored
+  // threshold 필터 → 점수 내림차순
+  const filtered = scored
     .filter(s => s.score >= threshold)
-    .sort((x, y) => y.score - x.score)
-    .slice(0, k)
-    .map(s => ({ ...s, source: 'match' }));
+    .sort((x, y) => y.score - x.score);
+  // mmrLambda < 1이면 MMR 재랭킹으로 다양성 확보(인덱스 벡터 재사용). 1.0/미지정이면 순수 관련도 topK(현행).
+  const lam = Number.isFinite(mmrLambda) ? mmrLambda : 1;
+  let picked;
+  if (lam < 1) {
+    const vecByKey = idxExists
+      ? new Map((idx.docs || []).map(d => [`${d.serverId}/${d.toolName}`, d.vec || []]))
+      : new Map();
+    picked = mmrRerank(filtered, vecByKey, lam, k);
+  } else {
+    picked = filtered.slice(0, k);
+  }
+  const matches = picked.map(s => ({ ...s, source: 'match' }));
 
   const results = expand(matches, mcps, { expandServer, expandCategory });
   return { results, usedMethod, requestedMethod: method, fallbackReason, topK: k, threshold };

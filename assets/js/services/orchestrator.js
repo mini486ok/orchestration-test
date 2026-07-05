@@ -5,7 +5,7 @@ import { chatJSON, getDefaultModel, getNumCtx } from './ollama.js';
 import { executeTool, validateParams } from './mockEngine.js';
 import { retrieve } from './catalogIndex.js';
 import { store } from '../core/store.js';
-import { graphRetrieve, graphStatus, GRAPH_KEY } from './catalogGraph.js';
+import { graphRetrieve, graphStatus, recommendPaths, GRAPH_KEY } from './catalogGraph.js';
 
 /* ============================================================
    기본 프롬프트
@@ -144,7 +144,7 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
   const date = new Date().toISOString().slice(0, 10);
   const catalog = buildToolCatalog(mcps);
   const byId = new Map((mcps || []).map(m => [m.id, m]));
-  const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false };
+  const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false, inputTokens: 0, outputTokens: 0, tokensEstimated: false };
   // react는 도구 오류를 관찰(observation)로 흘려보내 모델이 회복하도록 두므로 step 오류만으로 실패 처리하지 않는다.
   // prompt·db 모두 planningMode==='react'면 동일하게 처리(db도 프롬프트 실행 경로를 공유).
   const failOnStepError = !((strategy?.type === 'prompt' || strategy?.type === 'db') && cfg.planningMode === 'react');
@@ -191,11 +191,21 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
         res = await chatJSON({ model: ctx.model, messages, temperature: temperature ?? ctx.temperature, signal });
       } catch (e) {
         // 실패한 시도도 실제 HTTP 호출이므로 집계 (chatJSON이 e.llmCalls에 시도 횟수를 실어줌)
-        if (e?.name !== 'AbortError') result.llmCalls += (e?.llmCalls || 1);
+        if (e?.name !== 'AbortError') {
+          result.llmCalls += (e?.llmCalls || 1);
+          // 실패 경로에서도 chatJSON이 실어 보낸 누적 토큰을 성공 경로와 동일 로직으로 반영(0 과소기록 방지)
+          result.inputTokens += e?.promptTokens || 0;
+          result.outputTokens += e?.outputTokens || 0;
+          if (e?.tokensEstimated) result.tokensEstimated = true;
+        }
         throw e;
       }
       result.llmCalls += (res.calls || 1); // ollama.chatJSON이 실제 호출 수(1|2)를 반환하면 반영, 없으면 1로 폴백
       result.totalLatencyMs += res.durationMs || 0;
+      // 토큰 계측 누적(실측 우선, chatJSON이 내부 호출을 합산해 반환). 하나라도 추정이면 result 전체를 추정으로 표시.
+      result.inputTokens += res.promptTokens || 0;
+      result.outputTokens += res.outputTokens || 0;
+      if (res.tokensEstimated) result.tokensEstimated = true;
       emit('llm-response', `LLM 응답 (${Math.round(res.durationMs || 0)}ms)${res.retried ? ' · 형식 재요청됨' : ''}`, res.raw);
       return res.data;
     },
@@ -399,6 +409,12 @@ async function applyCatalogRetrieval(ctx, opts = {}) {
       expandServer: r.expandServer !== false,
       expandCategory: !!r.expandCategory,
       embedModel: r.embedModel || 'bge-m3:latest',
+      // MMR 다양성 재랭킹 파라미터(값만 전달, 재랭킹 구현은 catalogIndex 담당).
+      // 1.0=관련도만(현행, MMR off), 0.0=다양성 최대. 미설정 시 1.0으로 방어.
+      mmrLambda: Number.isFinite(r.mmrLambda) ? r.mmrLambda : 1.0,
+      // 문서 필드 구성(값만 전달, flatten/색인 구성은 catalogIndex 담당). 미지정(undefined)이면
+      // catalogIndex가 인덱스 구축값으로 방어하므로 stale 판정·검색이 정합적으로 동작한다.
+      docFields: r.docFields,
       signal: ctx.signal,
     });
   } catch (e) {
@@ -494,6 +510,11 @@ async function applyGraphRetrieval(ctx) {
   }
 
   const graph = store.get(GRAPH_KEY);
+  // 아래 graphRetrieve와 경로 추천(recommendPaths)에서 공용으로 재사용하는 순회 파라미터.
+  const seedMethod = g.seedMethod || 'hybrid';
+  const seedK = Number(g.seedK) > 0 ? Math.floor(Number(g.seedK)) : 5;
+  const maxDegree = Number(g.maxDegree) > 0 ? Math.floor(Number(g.maxDegree)) : 12;
+  const topKForGraph = Number(g.topK) > 0 ? Math.floor(Number(g.topK)) : 8;
   const t0 = performance.now();
   let res;
   try {
@@ -501,12 +522,17 @@ async function applyGraphRetrieval(ctx) {
       mcps: ctx.allMcps,
       graph,
       edgeParams: g.edges || {},
-      seedMethod: g.seedMethod || 'hybrid',
-      seedK: Number(g.seedK) > 0 ? Math.floor(Number(g.seedK)) : 5,
+      seedMethod,
+      seedK,
       hops: Number(g.hops) > 0 ? Math.floor(Number(g.hops)) : 2,
       decay: Number.isFinite(g.decay) ? g.decay : 0.5,
-      topK: Number(g.topK) > 0 ? Math.floor(Number(g.topK)) : 8,
+      topK: topKForGraph,
       embedModel,
+      // Graph 신규 파라미터(값만 전달, 적용은 catalogGraph의 graphRetrieve/effectiveAdjacency 담당).
+      // maxDegree: 노드별 최대 연결(io out-cap 포함) 상한. undefined면 기본 12로 방어.
+      // hubNorm: 확산 시 허브 degree 정규화(1/√deg) on/off. undefined면 기본 true로 방어.
+      maxDegree,
+      hubNorm: g.hubNorm !== false,
       signal: ctx.signal,
     });
   } catch (e) {
@@ -525,25 +551,89 @@ async function applyGraphRetrieval(ctx) {
     return;
   }
 
-  const reduced = reduceMcps(ctx.allMcps, results);
+  // 경로 추천(recommendPaths) 반영: graphRetrieve 후보에 추천 워크플로우 경로의 도구를 합집합으로 보강한다.
+  // 실패/예외/빈 결과는 무시하고 기존 graphRetrieve 후보만 사용(회귀 없음). AbortError만 전파.
+  let candidates = results;
+  {
+    const pathCfg = g.path || {};
+    // 사용 엣지: io는 항상, llm은 llm 엣지를 켰을 때만 유효(그래프 편집기 미리보기와 동일 규칙).
+    const pathEdges = (Array.isArray(pathCfg.edges) ? pathCfg.edges : ['io'])
+      .filter(t => t === 'io' || (t === 'llm' && g.edges?.llm?.on));
+    if (!pathEdges.length) pathEdges.push('io');
+    const tp = performance.now();
+    try {
+      const rec = await recommendPaths(ctx.query, {
+        mcps: ctx.allMcps,
+        graph,
+        edgeParams: g.edges || {},
+        seedMethod,
+        seedK,
+        edges: pathEdges,
+        beamWidth: pathCfg.beamWidth,
+        maxLen: pathCfg.maxLen,
+        maxDegree,
+        embedModel,
+        // P2: graphRetrieve가 이미 계산한 시드/질의 관련도를 재사용해 시드 이중 임베딩(질의 임베딩 2회)을 제거.
+        // (동일 seedMethod·seedK로 얻은 관련도이므로 recommendPaths 내부 재검색과 결과 동일 — 회귀 없음)
+        seeds: res.seeds,
+        relevance: res.relevance,
+        signal: ctx.signal,
+      });
+      ctx.result.totalLatencyMs += performance.now() - tp; // 경로 추천 임베딩(시드) 지연도 총 지연에 포함
+      const paths = (rec && Array.isArray(rec.paths)) ? rec.paths : [];
+      if (paths.length) {
+        // 상위 1~2개 경로의 도구를 순서대로 수집(기존 후보와 중복 제거).
+        const usePaths = paths.slice(0, 2);
+        const seen = new Set(results.map(r => `${r.serverId}/${r.toolName}`));
+        const added = [];
+        for (const p of usePaths) {
+          for (const s of (p.steps || [])) {
+            const key = `${s.serverId}/${s.toolName}`;
+            if (!seen.has(key)) { seen.add(key); added.push({ serverId: s.serverId, toolName: s.toolName }); }
+          }
+        }
+        if (added.length) {
+          // 전체 상한(topK) 유지: 경로 도구를 우선 포함하고, 상한 초과분은 하위 graph 후보부터 잘라 자리를 확보한다.
+          candidates = (results.length + added.length > topKForGraph)
+            ? [...results.slice(0, Math.max(0, topKForGraph - added.length)), ...added]
+            : [...results, ...added];
+          const summary = usePaths
+            .map(p => (p.steps || []).map(s => `${s.serverId}/${s.toolName}`).join(' → '))
+            .join(' | ');
+          ctx.emit('info', `경로 추천 반영: ${added.length}개 도구 추가 (${summary})`);
+        }
+      }
+    } catch (e) {
+      ctx.result.totalLatencyMs += performance.now() - tp;
+      if (e?.name === 'AbortError') throw e;
+      // 경로 추천 실패는 무시하고 기존 graphRetrieve 후보만 사용(회귀 없음).
+    }
+  }
+
+  // P1: 경로 도구 합집합 후 최종 상한(topK) 강제 — 극단 config(추가 도구 수 > topK)에서도 총량이 topK를 넘지 않도록 보장.
+  if (candidates.length > topKForGraph) candidates = candidates.slice(0, topKForGraph);
+
+  const reduced = reduceMcps(ctx.allMcps, candidates);
   ctx.catalog = buildToolCatalog(reduced);
 
   const hops = Number(g.hops) > 0 ? Math.floor(Number(g.hops)) : 2;
+  // P3: 상세(detail.tools)와 카운트를 최종 candidates 기준으로 표기 — 경로추천으로 추가된 도구도 목록에 반영(카운트·목록 일치).
+  // 경로추천으로 추가된 후보는 score/source/hop이 없으므로 source는 'path'로 표기하고 나머지는 비워 둔다(JSON에서 자연 생략).
   const detail = {
     seeds: (res.seeds || []).map(s => `${s.serverId}/${s.toolName}(${s.score})`),
     usedEmbed: res.usedEmbed,
     fallbackReason: res.fallbackReason || null,
     servers: reduced.length,
-    tools: results.map(x => ({
+    tools: candidates.map(x => ({
       tool: `${x.serverId}/${x.toolName}`,
       score: x.score,
-      source: x.source,
+      source: x.source || 'path',
       hop: x.hop,
       via: (x.viaEdges || []).join('+') || undefined,
     })),
   };
   ctx.emit('info',
-    `DB 검색(graph): ${results.length}개 도구 (시드 ${res.seeds?.length || 0}개, hops=${hops})${res.fallbackReason ? ' · ' + res.fallbackReason : ''}`,
+    `DB 검색(graph): ${candidates.length}개 도구 (시드 ${res.seeds?.length || 0}개, hops=${hops})${res.fallbackReason ? ' · ' + res.fallbackReason : ''}`,
     detail);
 }
 

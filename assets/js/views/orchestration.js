@@ -117,7 +117,12 @@ export async function render(container, ctx) {
   }
 
   function defaultVectorCfg() {
-    return { method: 'hybrid', topK: 8, threshold: 0, hybridAlpha: 0.5, expandServer: true, expandCategory: false, embedModel: 'bge-m3:latest' };
+    return {
+      method: 'hybrid', topK: 8, threshold: 0, hybridAlpha: 0.5, expandServer: true, expandCategory: false, embedModel: 'bge-m3:latest',
+      // v2 신규(§2): 임베딩 문서 구성 토글 + MMR 다양성. 기본값은 현행과 동일(desc+params 포함, MMR off).
+      docFields: { desc: true, params: true, outputs: false, examples: false, tags: false },
+      mmrLambda: 1.0,   // 1.0=관련도만(MMR off) · 0.0=다양성 최대. 검색 시점 적용(재색인 불필요).
+    };
   }
   function defaultGraphCfg() {
     return {
@@ -132,7 +137,34 @@ export async function render(container, ctx) {
       seedMethod: 'hybrid', seedK: 5, hops: 2, decay: 0.5, topK: 8,
       embedModel: null,    // null → 임베딩 기본 'bge-m3:latest'
       extractModel: null,  // null → settings.defaultModel (llm 엣지 추출용)
+      // v2 신규(§3): degree 상한 · 허브 정규화 · 경로 추천 파라미터.
+      maxDegree: 12,       // 노드별 최대 연결(io 출력 상한 포함). effectiveAdjacency 캡.
+      hubNorm: true,       // 확산 시 허브 degree 정규화(1/√deg) on/off.
+      path: { beamWidth: 6, maxLen: 4, edges: ['io'] },  // recommendPaths 빔 폭/최대 길이/사용 엣지.
     };
+  }
+
+  // v2 하위호환 back-fill — 구버전·가져온 전략에 신규 필드가 없을 때만 기본값으로 채운다(기존 값 보존·회귀 방지).
+  function backfillVectorCfg(v) {
+    if (!v) return v;
+    const d = defaultVectorCfg();
+    if (!v.docFields || typeof v.docFields !== 'object') v.docFields = { ...d.docFields };
+    else for (const k in d.docFields) if (typeof v.docFields[k] !== 'boolean') v.docFields[k] = d.docFields[k];
+    if (typeof v.mmrLambda !== 'number') v.mmrLambda = d.mmrLambda;
+    return v;
+  }
+  function backfillGraphCfg(g) {
+    if (!g) return g;
+    const d = defaultGraphCfg();
+    if (typeof g.maxDegree !== 'number') g.maxDegree = d.maxDegree;
+    if (typeof g.hubNorm !== 'boolean') g.hubNorm = d.hubNorm;
+    if (!g.path || typeof g.path !== 'object') g.path = { ...d.path };
+    else {
+      if (typeof g.path.beamWidth !== 'number') g.path.beamWidth = d.path.beamWidth;
+      if (typeof g.path.maxLen !== 'number') g.path.maxLen = d.path.maxLen;
+      if (!Array.isArray(g.path.edges) || !g.path.edges.length) g.path.edges = [...d.path.edges];
+    }
+    return g;
   }
 
   function defaultConfig(type) {
@@ -657,12 +689,15 @@ export async function render(container, ctx) {
 
   /* ---------- db 편집기 (vector / graph) ---------- */
   function dbEditor(draft) {
+    ensureDbUiExtStyles(); // v2 확장 스타일(.gv-tip 등)을 main.css 수정 없이 1회만 주입
     const cfg = draft.config;
     // 이전 버전·가져온 전략 방어: 누락 필드 보강
     if (cfg.store !== 'vector' && cfg.store !== 'graph') cfg.store = 'vector';
     if (!cfg.vector) cfg.vector = defaultVectorCfg();
     if (!cfg.graph) cfg.graph = defaultGraphCfg();
     if (!cfg.graph.edges) cfg.graph.edges = defaultGraphCfg().edges;
+    backfillVectorCfg(cfg.vector);  // v2 신규 필드(docFields/mmrLambda) 보강
+    backfillGraphCfg(cfg.graph);    // v2 신규 필드(maxDegree/hubNorm/path) 보강
     if (cfg.temperature == null) cfg.temperature = 0.1;
     if (cfg.maxSteps == null) cfg.maxSteps = 6;
     if (!cfg.planningMode) cfg.planningMode = 'plan';
@@ -722,6 +757,7 @@ export async function render(container, ctx) {
   /* ----- db: vector db 편집기 ----- */
   function dbVectorEditor(cfg) {
     const r = cfg.vector;
+    backfillVectorCfg(r); // 직접 참조(docFields/mmrLambda) 전 보강
     const alphaLabel = (a) => `${Number(a).toFixed(2)} (벡터)`;
     const alphaVal = el('span', { class: 'mono', style: { minWidth: '76px' } }, alphaLabel(r.hybridAlpha ?? 0.5));
     const alphaInput = el('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(r.hybridAlpha ?? 0.5) });
@@ -759,6 +795,35 @@ export async function render(container, ctx) {
       el('label', { class: 'chk-row' }, expSrv, el('span', {}, '같은 서버 도구 포함 (expandServer)')),
       el('label', { class: 'chk-row' }, expCat, el('span', {}, '같은 카테고리 도구 포함 (expandCategory)')));
 
+    // v2(§2): 임베딩 문서 구성 — 인덱싱 시 각 도구 문서에 포함할 요소. 변경 시 재색인 필요(amber 안내).
+    const DOC_FIELD_DEFS = [
+      ['desc', '설명 (desc)', '도구·서버 설명 텍스트'],
+      ['params', '입력 파라미터 (params)', '입력 파라미터 이름·설명'],
+      ['outputs', '출력 스키마 (outputs)', '출력 스키마 키·설명'],
+      ['examples', '예시 (examples)', 'examples·mock 샘플 값'],
+      ['tags', '태그 (tags)', '서버 tags'],
+    ];
+    const docFieldsWarn = el('div', { class: 'idx-warn', style: { display: 'none', marginTop: '6px' } },
+      '⚠ 임베딩 문서 구성을 변경했습니다. 검색에 반영하려면 아래에서 인덱스를 재구축(재색인)하세요.');
+    const docChecks = el('div', { class: 'row wrap', style: { gap: '14px' } },
+      ...DOC_FIELD_DEFS.map(([key, label, tip]) => {
+        const chk = el('input', { type: 'checkbox', checked: !!r.docFields[key] });
+        chk.addEventListener('change', () => { r.docFields[key] = chk.checked; docFieldsWarn.style.display = ''; renderStatus(); });
+        return el('label', { class: 'chk-row', title: tip }, chk, el('span', {}, label));
+      }));
+    const docFieldsGroup = el('div', { class: 'stack', style: { gap: '2px' } }, docChecks, docFieldsWarn);
+
+    // v2(§2): MMR 다양성 λ — 검색 시점 재정렬(재색인 불필요). 1=관련도만(MMR off), 0=다양성 최대.
+    const mmrLabel = (v) => {
+      const n = Number(v);
+      if (n >= 0.999) return '1.00 · 관련도만(MMR off)';
+      if (n <= 0.001) return '0.00 · 다양성 최대';
+      return n.toFixed(2);
+    };
+    const mmrVal = el('span', { class: 'mono', style: { minWidth: '156px' } }, mmrLabel(r.mmrLambda ?? 1));
+    const mmrInput = el('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(r.mmrLambda ?? 1) });
+    mmrInput.addEventListener('input', () => { r.mmrLambda = Number(mmrInput.value); mmrVal.textContent = mmrLabel(r.mmrLambda); });
+
     // 인덱스 상태 카드 (catalogIndex 재사용)
     const statusBox = el('div', { class: 'idx-card' });
     const progBar = el('div', { class: 'idx-prog-fill' });
@@ -767,7 +832,8 @@ export async function render(container, ctx) {
       el('div', { class: 'idx-prog-track' }, progBar), progText);
     let building = false;
     function renderStatus() {
-      const st = indexStatus(mcps, r.embedModel || 'bge-m3:latest');
+      // §2/U2: 현재 문서 구성(docFields)까지 함께 넘겨, 인덱스 구축 시점과 구성이 다르면 stale로 정확히 표시(재진입 시 stale 정확 표시).
+      const st = indexStatus(mcps, r.embedModel || 'bge-m3:latest', r.docFields);
       const rows = [];
       if (!st.exists) {
         rows.push(el('div', { class: 'idx-state' }, el('span', { class: 'idx-dot off' }),
@@ -795,12 +861,13 @@ export async function render(container, ctx) {
       const t0 = performance.now();
       try {
         await buildIndex({
-          mcps, embedModel: model, signal: vectorBuildAbort.signal,
+          mcps, embedModel: model, docFields: r.docFields, signal: vectorBuildAbort.signal, // §2: 문서 구성 토글 전달
           onProgress: ({ done, total }) => {
             const pct = total ? Math.round(done / total * 100) : 0;
             progBar.style.width = pct + '%'; progText.textContent = `임베딩 ${done}/${total} (${pct}%)`;
           },
         });
+        docFieldsWarn.style.display = 'none'; // 재색인 완료 → 문서 구성 변경 경고 해제
         toast(`벡터 인덱스를 구축했습니다 · 도구 ${mcps.reduce((n, m) => n + (m.tools?.length || 0), 0)}개 · ${Math.round((performance.now() - t0) / 1000)}초 (${model}).`, 'success');
       } catch (e) {
         if (e?.name === 'AbortError') toast('인덱스 구축을 중단했습니다.', 'warn');
@@ -819,6 +886,8 @@ export async function render(container, ctx) {
       field({ label: '점수 임계값 (threshold)', input: el('div', { class: 'row' }, thInput, thVal), hint: '이 점수 미만 도구 제외 · 벡터=코사인, 하이브리드=정규화 0~1' }),
       alphaWrap,
       field({ label: '이웃 확장', input: checks, hint: '검색된 도구의 서버/카테고리 이웃 도구를 함께 공급합니다.' }),
+      field({ label: '임베딩 문서 구성 (docFields)', input: docFieldsGroup, hint: '인덱싱 시 각 도구 문서에 포함할 요소. 기본: 설명+입력 파라미터. 변경하면 인덱스를 재구축해야 반영됩니다.' }),
+      field({ label: 'MMR 다양성 (λ)', input: el('div', { class: 'row' }, mmrInput, mmrVal), hint: 'λ=1 관련도만(MMR off·현행) · λ=0 다양성 최대 · 검색 시점 재정렬이라 재색인 불필요' }),
       el('div', { class: 'panel-title', style: { marginTop: '4px' } }, '벡터 인덱스 상태'),
       statusBox);
   }
@@ -829,6 +898,7 @@ export async function render(container, ctx) {
     // 누락 필드 방어(구버전/가져온 db 전략): llm 엣지·extractModel 보강
     if (!g.edges) g.edges = defaultGraphCfg().edges;
     if (!g.edges.llm) g.edges.llm = { on: false, weight: 1.0, threshold: 1 };
+    backfillGraphCfg(g); // v2 신규 필드(maxDegree/hubNorm/path) 직접 참조 전 보강
     const defaultEmbed = 'bge-m3:latest';
     const defaultExtract = store.get('settings')?.defaultModel || 'exaone3.5:7.8b';
     const GRAPH_KEY = graphMod?.GRAPH_KEY || 'catalogGraph';
@@ -872,7 +942,8 @@ export async function render(container, ctx) {
     // 반환: { edges, nodeIdxs, note } 또는 { error }
     function prepareVizEdges(graph, edgeParams) {
       let adj;
-      try { adj = graphMod.effectiveAdjacency(graph, edgeParams); }
+      // §3: 노드 degree 상한·허브 정규화를 엔진에 전달(런타임 캡 → 재구축 불필요).
+      try { adj = graphMod.effectiveAdjacency(graph, edgeParams, { maxDegree: g.maxDegree, hubNorm: g.hubNorm }); }
       catch (e) { return { error: '그래프 계산 오류: ' + (e?.message || e) }; }
       const edgeMap = new Map();
       adj.forEach((arr, from) => {
@@ -947,6 +1018,32 @@ export async function render(container, ctx) {
       if (focus != null) { neighbors.add(focus); edges.forEach(e => { if (e.a === focus) neighbors.add(e.b); if (e.b === focus) neighbors.add(e.a); }); }
       const dimmed = (i) => focus != null && !neighbors.has(i);
 
+      // 표시 엣지 기준 노드별 연결 수(툴팁의 "연결 N"에 사용)
+      const degMap = new Map();
+      for (const e of edges) { degMap.set(e.a, (degMap.get(e.a) || 0) + 1); degMap.set(e.b, (degMap.get(e.b) || 0) + 1); }
+
+      // §4 리치 호버 툴팁 — 뷰포트(.graph-viz-wrap) 내부 절대배치 HTML 오버레이(pointer-events:none).
+      const wrap = el('div', { class: 'graph-viz-wrap' });
+      const tip = el('div', { class: 'gv-tip', style: { display: 'none' } });
+      function moveTip(clientX, clientY) {
+        const wr = wrap.getBoundingClientRect();
+        if (!wr.width) return;
+        const tw = tip.offsetWidth || 190, th = tip.offsetHeight || 60;
+        let x = clientX - wr.left + 14, y = clientY - wr.top + 14;
+        if (x + tw > wr.width - 4) x = clientX - wr.left - tw - 14;   // 오른쪽 경계 → 왼쪽으로
+        if (x < 4) x = 4;
+        if (y + th > wr.height - 4) y = wr.height - th - 4;            // 아래 경계 → 위로 clamp
+        if (y < 4) y = 4;
+        tip.style.left = x.toFixed(0) + 'px';
+        tip.style.top = y.toFixed(0) + 'px';
+      }
+      function showTip(clientX, clientY, rows) {
+        tip.replaceChildren(...rows.filter(Boolean));
+        tip.style.display = '';
+        moveTip(clientX, clientY);
+      }
+      const hideTip = () => { tip.style.display = 'none'; };
+
       const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, width: '100%', class: 'graph-svg', preserveAspectRatio: 'xMidYMid meet' });
       svg.appendChild(svgEl('defs', {}, arrowMarker(`${idPrefix}-arrow-io`, EDGE_META.io.color), arrowMarker(`${idPrefix}-arrow-llm`, EDGE_META.llm.color)));
       const pan = svgEl('g', { class: 'gv-pan' });
@@ -967,6 +1064,22 @@ export async function render(container, ctx) {
           'marker-end': showArrow ? `url(#${idPrefix}-arrow-${e.type === 'llm' ? 'llm' : 'io'})` : null,
         });
         line.appendChild(svgEl('title', {}, `${e.type}${meta.directed ? ' (A→B)' : ''} · w=${e.w.toFixed(2)}`));
+        // §4: 엣지 리치 호버 — 유형 라벨 + 의미 1줄 + 방향(A도구→B도구) + 가중치.
+        const emeta = EDGE_META[e.type] || {};
+        const eLabel = emeta.label || e.type;
+        const eDesc = emeta.desc || EDGE_DESC_FALLBACK[e.type] || '두 도구 사이의 연결입니다.';
+        const nodeA = graph.nodes[e.a], nodeB = graph.nodes[e.b];
+        const dirText = emeta.directed
+          ? `${nodeA?.toolName || '?'} → ${nodeB?.toolName || '?'}`
+          : `${nodeA?.toolName || '?'} ↔ ${nodeB?.toolName || '?'}`;
+        line.addEventListener('pointerenter', (ev) => showTip(ev.clientX, ev.clientY, [
+          el('div', { class: 'gv-tip-h' }, eLabel),
+          el('div', { class: 'gv-tip-meta' }, eDesc),
+          el('div', { class: 'gv-tip-tool' }, dirText),
+          el('div', { class: 'gv-tip-meta' }, `가중치 w=${(e.w ?? 0).toFixed(2)}`),
+        ]));
+        line.addEventListener('pointermove', (ev) => moveTip(ev.clientX, ev.clientY));
+        line.addEventListener('pointerleave', hideTip);
         gEdges.appendChild(line);
       }
       pan.appendChild(gEdges);
@@ -995,6 +1108,20 @@ export async function render(container, ctx) {
           grp.appendChild(t);
         }
         grp.addEventListener('click', () => { if (panState.dragged) return; onNodeClick(i); });
+        // §4: 노드 리치 호버 — 아이콘 + 서버 nameKo + / 도구명 + 분야 + (연결 수/시드/선택).
+        const srv = mcps.find(m => m.id === node.serverId);
+        const nIcon = srv?.icon || '🔧';
+        const nServerKo = srv?.nameKo || node.serverNameKo || node.serverId;
+        const nCat = node.category || '기타';
+        const nDeg = degMap.get(i) || 0;
+        const tags = [`연결 ${nDeg}`, isSeed ? '시드' : null, isSel ? '선택' : null].filter(Boolean).join(' · ');
+        grp.addEventListener('pointerenter', (ev) => showTip(ev.clientX, ev.clientY, [
+          el('div', { class: 'gv-tip-h' }, `${nIcon} ${nServerKo}`),
+          el('div', { class: 'gv-tip-tool' }, '/ ' + (node.toolName || '')),
+          el('div', { class: 'gv-tip-meta' }, `분야 ${nCat} · ${tags}`),
+        ]));
+        grp.addEventListener('pointermove', (ev) => moveTip(ev.clientX, ev.clientY));
+        grp.addEventListener('pointerleave', hideTip);
         gNodes.appendChild(grp);
       }
       pan.appendChild(gNodes);
@@ -1027,7 +1154,10 @@ export async function render(container, ctx) {
       svg.addEventListener('pointerup', endDrag);
       svg.addEventListener('pointerleave', endDrag);
       svg.addEventListener('dblclick', (e) => { e.preventDefault(); scale = 1; tx = 0; ty = 0; apply(); }); // 더블클릭: 확대/이동 초기화
-      return svg;
+      // svg + 툴팁 오버레이를 한 뷰포트(.graph-viz-wrap)에 담아 반환한다(오버레이 절대배치 기준).
+      wrap.appendChild(svg);
+      wrap.appendChild(tip);
+      return wrap;
     }
 
     // 표시 옵션 컨트롤 바(요약/전체 · semantic 표시 · 크게 보기)
@@ -1068,11 +1198,12 @@ export async function render(container, ctx) {
       if (state.layout && state.layoutKey === lkey) pos = state.layout;
       else { pos = forceLayout(graph, nodeIdxs, edges, W, H, PAD); state.layout = pos; state.layoutKey = lkey; }
 
-      const svg = buildGraphSvg({
+      // buildGraphSvg는 .graph-viz-wrap(svg + 툴팁 오버레이)을 통째로 반환한다.
+      const vizWrap = buildGraphSvg({
         graph, edges, nodeIdxs, pos, state, W, H, idPrefix: 'gv', wheelNeedsCtrl: true,
         onNodeClick: (i) => { state.focusNode = (state.focusNode === i ? null : i); redrawViz(); },
       });
-      host.appendChild(el('div', { class: 'graph-viz-wrap' }, svg));
+      host.appendChild(vizWrap);
       legendBlocks(edges, nodeIdxs, graph).forEach(b => host.appendChild(b));
       if (note) host.appendChild(el('div', { class: 'hint', style: { color: 'var(--sig-amber)', marginTop: '4px' } }, 'ⓘ ' + note));
       host.appendChild(el('div', { class: 'hint', style: { marginTop: '2px' } },
@@ -1101,12 +1232,12 @@ export async function render(container, ctx) {
           bigState.layout = forceLayout(graph, prep.nodeIdxs, prep.edges, W, H, PAD);
           bigState.layoutKey = lkey;
         }
-        const svg = buildGraphSvg({
+        const vizWrap = buildGraphSvg({
           graph, edges: prep.edges, nodeIdxs: prep.nodeIdxs, pos: bigState.layout, state: bigState, W, H,
           idPrefix: 'gvbig', wheelNeedsCtrl: false,
           onNodeClick: (i) => { bigState.focusNode = (bigState.focusNode === i ? null : i); paint(); },
         });
-        host.replaceChildren(el('div', { class: 'graph-viz-wrap' }, svg));
+        host.replaceChildren(vizWrap);
         legendHost.replaceChildren(...[
           ...legendBlocks(prep.edges, prep.nodeIdxs, graph),
           prep.note ? el('div', { class: 'hint', style: { color: 'var(--sig-amber)', marginTop: '4px' } }, 'ⓘ ' + prep.note) : null,
@@ -1163,7 +1294,8 @@ export async function render(container, ctx) {
         // 정보 누출 경고(cooccur 등) — el 헬퍼가 null 자식을 걸러내므로 조건부로 전달(U9)
         meta.warn ? el('div', { class: 'ec-desc hint ec-warn' }, meta.warn) : null);
       // semantic/llm은 상태 카드(인덱스·LLM 안내)에도 영향 → 토글 시 상태 카드 갱신
-      onChk.addEventListener('change', () => { ep.on = onChk.checked; card.classList.toggle('off', !ep.on); scheduleRedraw(); if (type === 'semantic' || type === 'llm') renderGraphStatus(); });
+      // llm 토글은 경로 추천 "사용 엣지" 세그먼트 활성/비활성에도 영향 → 함께 동기화.
+      onChk.addEventListener('change', () => { ep.on = onChk.checked; card.classList.toggle('off', !ep.on); scheduleRedraw(); if (type === 'semantic' || type === 'llm') renderGraphStatus(); if (type === 'llm') renderPathEdgesSeg(); });
       return card;
     }
 
@@ -1187,6 +1319,36 @@ export async function render(container, ctx) {
       value: g.extractModel || null, defaultModel: defaultExtract, embedding: false,
       onChange: (v) => { g.extractModel = v; renderGraphStatus(); },
     });
+
+    /* --- v2(§3): degree 상한 · 허브 정규화 · 경로 추천 파라미터 --- */
+    // maxDegree/hubNorm은 effectiveAdjacency(시각화)에 즉시 반영 → 변경 시 재그리기.
+    const maxDegInput = numInput(g.maxDegree ?? 12, 4, 30, (v) => { g.maxDegree = v; scheduleRedraw(); });
+    const hubChk = el('input', { type: 'checkbox', checked: g.hubNorm !== false });
+    hubChk.addEventListener('change', () => { g.hubNorm = hubChk.checked; scheduleRedraw(); });
+    // 경로 추천: 빔 폭·최대 길이(런타임 파라미터, 재구축 불필요).
+    const beamInput = numInput(g.path.beamWidth ?? 6, 1, 20, (v) => g.path.beamWidth = v);
+    const pathLenInput = numInput(g.path.maxLen ?? 4, 2, 6, (v) => g.path.maxLen = v);
+    // 사용 엣지 세그먼트(io / io+llm) — 자체 제어. io+llm은 llm 엣지가 켜져 있을 때만 활성.
+    const pathEdgesSeg = el('div', { class: 'seg', role: 'tablist' });
+    function renderPathEdgesSeg() {
+      const llmOn = !!g.edges.llm?.on;
+      // llm 엣지가 꺼지면 경로 엣지에서 llm 제거(강제 io).
+      if (!llmOn && Array.isArray(g.path.edges) && g.path.edges.includes('llm')) g.path.edges = ['io'];
+      const useLlm = llmOn && Array.isArray(g.path.edges) && g.path.edges.includes('llm');
+      const cur = useLlm ? 'io_llm' : 'io';
+      const mk = (val, label, disabled) => {
+        const b = el('button', { class: val === cur ? 'on' : '', type: 'button', role: 'tab', disabled,
+          title: disabled ? 'llm 엣지를 먼저 켜야 사용할 수 있습니다.' : '' }, label);
+        if (!disabled) b.addEventListener('click', () => {
+          if (val === cur) return;
+          g.path.edges = (val === 'io_llm') ? ['io', 'llm'] : ['io'];
+          renderPathEdgesSeg();
+        });
+        return b;
+      };
+      pathEdgesSeg.replaceChildren(mk('io', 'io만', false), mk('io_llm', 'io + llm', !llmOn));
+    }
+    renderPathEdgesSeg();
 
     /* --- 그래프 db 상태 카드 + 구축 --- */
     const statusBox = el('div', { class: 'idx-card' });
@@ -1352,16 +1514,23 @@ export async function render(container, ctx) {
         const ret = await graphMod.graphRetrieve(q, {
           mcps, graph, edgeParams: g.edges, seedMethod: g.seedMethod, seedK: g.seedK,
           hops: g.hops, decay: g.decay, topK: g.topK, embedModel: g.embedModel,
+          maxDegree: g.maxDegree, hubNorm: g.hubNorm, // §3: degree 상한·허브 정규화
         });
         renderPreview(ret, graph);
       } catch (e) {
         previewHost.replaceChildren(el('div', { class: 'idx-warn' }, '검색 실패: ' + (e?.message || e)));
       }
       try {
-        // llm 엣지가 켜져 있으면 경로 탐색 대상에 llm(방향)도 포함(U1). 기본은 io.
-        const pathEdges = g.edges.llm?.on ? ['io', 'llm'] : ['io'];
+        // §3: 경로 추천 파라미터(edges/beamWidth/maxLen)를 설정값에서 사용. llm은 llm 엣지 on일 때만 유효.
+        const pathEdges = (Array.isArray(g.path.edges) ? g.path.edges : ['io'])
+          .filter(t => t === 'io' || (t === 'llm' && g.edges.llm?.on));
+        if (!pathEdges.length) pathEdges.push('io');
         const rec = await graphMod.recommendPaths(q, {
-          mcps, graph, edgeParams: g.edges, seedMethod: g.seedMethod, seedK: Math.min(3, g.seedK || 3), maxLen: 4, pathEdges, embedModel: g.embedModel,
+          mcps, graph, edgeParams: g.edges, seedMethod: g.seedMethod, seedK: Math.min(3, g.seedK || 3),
+          edges: pathEdges, beamWidth: g.path.beamWidth, maxLen: g.path.maxLen,
+          maxDegree: g.maxDegree, // §3/arch A2: 노드 최대 연결 상한을 경로 탐색에도 동일 적용(미리보기·실행 일관)
+          pathEdges, // 하위호환: 구 시그니처(pathEdges) 병행 전달
+          embedModel: g.embedModel,
         });
         renderPaths(rec, graph, pathEdges);
       } catch (e) {
@@ -1384,7 +1553,14 @@ export async function render(container, ctx) {
         field({ label: '시드 수 (seedK)', input: seedKInput, hint: '시작 도구 개수 (1~20)' }),
         field({ label: '홉 수 (hops)', input: hopsInput, hint: '시드에서 몇 단계까지 확산할지 (1~4)' }),
         field({ label: '감쇠 (decay)', input: el('div', { class: 'row' }, decayInput, decayVal), hint: '홉이 멀수록 점수를 줄이는 비율 (0~1)' }),
-        field({ label: '상위 K (topK)', input: topKInput, hint: '최종 공급할 도구 수 (1~30)' })),
+        field({ label: '상위 K (topK)', input: topKInput, hint: '최종 공급할 도구 수 (1~30)' }),
+        field({ label: '노드 최대 연결 (maxDegree)', input: maxDegInput, hint: '노드별 최대 연결 수(io 출력 상한 포함) 4~30 · 축소는 즉시 반영, 확대는 재구축이 필요할 수 있음' }),
+        field({ label: '허브 정규화 (hubNorm)', input: el('label', { class: 'chk-row' }, hubChk, el('span', {}, '허브 degree 정규화(1/√deg)')), hint: '연결이 많은 허브 노드의 확산 기여를 낮춰 결과 편중을 줄입니다.' })),
+      el('div', { class: 'panel-title', style: { marginTop: '6px' } }, '경로 추천 (recommendPaths)'),
+      el('div', { class: 'grid cols-2' },
+        field({ label: '빔 폭 (beamWidth)', input: beamInput, hint: '경로 탐색 시 유지할 후보 경로 수 (1~20)' }),
+        field({ label: '최대 경로 길이 (maxLen)', input: pathLenInput, hint: '추천 워크플로우의 최대 단계 수 (2~6)' }),
+        field({ label: '사용 엣지 (edges)', input: pathEdgesSeg, hint: 'io: 입출력 방향 엣지만 · io+llm: llm 방향 엣지도 포함(llm 엣지 on일 때만 활성)' })),
       el('div', { class: 'panel-title', style: { marginTop: '6px' } }, '모델 선택'),
       el('div', { class: 'grid cols-2' },
         field({ label: '임베딩 모델 (embedModel)', input: gEmbedI, hint: 'semantic 엣지·벡터/하이브리드 시드에 사용 · 미선택 시 bge-m3:latest' }),
@@ -1609,6 +1785,41 @@ const EDGE_META = {
   cooccur: { label: 'cooccur — 공동 출현', short: 'cooccur (성긴 점선)', color: '#c6d0e0', dash: '2 6', directed: false, hasTh: true, thStep: '1', warn: '⚠ 벤치마크 정답 워크플로우에서 추출한 엣지입니다. 같은 벤치마크로 평가하면 정보 누출로 성능이 과대평가될 수 있습니다(기본 off 권장).', desc: '벤치마크 정답 워크플로우에서 함께 등장한 도구쌍을 연결합니다(등장 횟수).' },
   llm: { label: 'llm — LLM 의미 관계', short: 'llm (일점쇄선·방향)', color: '#dcc9a0', dash: '9 3 2 3', directed: true, hasTh: true, thStep: '1', heavy: true, desc: '⏱ LLM으로 도구 간 의미 관계를 추출해 A→B로 연결합니다(스키마가 달라도 개념이 이어지면 연결). 그래프 구축 시 도구당 1회 LLM 호출이 필요해 시간이 걸립니다 · 기본 off.' },
 };
+
+// §4 호버 툴팁용 짧은 의미 설명(EDGE_META.desc가 없거나 유형 미상일 때의 폴백).
+const EDGE_DESC_FALLBACK = {
+  io: '도구 A의 출력이 도구 B의 입력과 이어지는 방향 연결입니다.',
+  semantic: '임베딩 유사도가 높은 도구쌍을 잇는 연결입니다.',
+  server: '같은 MCP 서버에 속한 도구끼리의 연결입니다.',
+  category: '같은 분야(카테고리) 도구끼리의 연결입니다.',
+  cooccur: '벤치마크 정답에서 함께 등장한 도구쌍의 연결입니다.',
+  llm: 'LLM이 추출한 도구 간 의미 관계(방향) 연결입니다.',
+};
+
+// v2 DB 편집기 확장 스타일 — main.css를 수정하지 않고 이 뷰에서 1회만 <style id="rbtl-dbui-ext">를 주입한다.
+// (이미 존재하면 재주입하지 않음). .graph-viz-wrap을 position:relative로 만들어 .gv-tip 오버레이의 기준으로 삼는다.
+function ensureDbUiExtStyles() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById('rbtl-dbui-ext')) return;
+  const style = document.createElement('style');
+  style.id = 'rbtl-dbui-ext';
+  style.textContent = [
+    '.graph-viz-wrap { position: relative; }',
+    '.gv-tip {',
+    '  position: absolute; z-index: 20; pointer-events: none;',
+    '  max-width: 260px; padding: 7px 9px;',
+    '  background: rgba(14, 20, 30, 0.92); border: 1px solid rgba(150, 170, 200, 0.28);',
+    '  border-radius: 7px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.42);',
+    "  font-family: var(--font-mono, 'IBM Plex Mono', monospace); font-size: 11px;",
+    '  line-height: 1.5; color: #e8eef6; backdrop-filter: blur(2px);',
+    '}',
+    '.gv-tip-h { font-size: 12px; font-weight: 600; color: #ffffff; margin-bottom: 1px; }',
+    '.gv-tip-tool { color: #aedcff; word-break: break-all; }',
+    '.gv-tip-meta { color: #9fb0c8; font-size: 10.5px; }',
+    '.seg button:disabled { opacity: 0.4; cursor: not-allowed; }',
+  ].join('\n');
+  document.head.appendChild(style);
+}
 
 // buildGraph onProgress.phase → 한국어 진행 표시
 const PHASE_LABEL = {

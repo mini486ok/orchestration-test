@@ -23,6 +23,28 @@ function fileSlug(s) {
   return String(s || 'set').trim().replace(/\s+/g, '-').replace(/[^\w가-힣-]/g, '').slice(0, 40) || 'set';
 }
 
+/* ---------- 세트 조합 전용 스타일 (main.css 미수정 → 1회 주입) ---------- */
+function ensureBenchCombineStyles() {
+  if (document.getElementById('rbtl-benchcombine-ext')) return;
+  const style = el('style', { id: 'rbtl-benchcombine-ext' });
+  style.textContent = `
+    .rbtl-bc-sets { display:flex; flex-direction:column; gap:10px; max-height:44vh; overflow-y:auto; padding:2px; margin-top:4px; }
+    .rbtl-bc-set { border:1px solid var(--line-soft); border-radius:var(--r2); background:var(--bg2); overflow:hidden; }
+    .rbtl-bc-set-head { display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--bg0); border-bottom:1px solid var(--line-soft); cursor:pointer; user-select:none; }
+    .rbtl-bc-set-head:hover { background:var(--bg3); }
+    .rbtl-bc-set-name { font-weight:600; color:var(--tx0); font-size:13px; }
+    .rbtl-bc-set-head input[type=checkbox], .rbtl-bc-item input[type=checkbox] { width:15px; height:15px; accent-color:var(--sig-green); flex-shrink:0; cursor:pointer; margin:0; }
+    .rbtl-bc-items { display:flex; flex-direction:column; }
+    .rbtl-bc-item { display:flex; align-items:center; gap:10px; padding:8px 12px 8px 30px; border-bottom:1px solid var(--line-soft); cursor:pointer; font-size:12.5px; color:var(--tx1); user-select:none; }
+    .rbtl-bc-item:last-child { border-bottom:none; }
+    .rbtl-bc-item:hover { background:var(--bg3); }
+    .rbtl-bc-q { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .rbtl-bc-steps { color:var(--tx2); font-size:11px; font-family:var(--font-mono); white-space:nowrap; flex-shrink:0; }
+    .rbtl-bc-empty { padding:9px 12px 9px 30px; color:var(--tx3); font-size:12px; }
+  `;
+  document.head.appendChild(style);
+}
+
 /* ---------- 가져오기 정규화 ---------- */
 function normalizeImportedItem(it) {
   if (!it || typeof it !== 'object') return null;
@@ -59,6 +81,12 @@ function normalizeImportedItem(it) {
         })))
       .filter(alt => alt.length > 0);
     if (alts.length) out.alternatives = alts;
+  }
+  // 목표 도구(goal) 보존 — 가이드 약속·evaluator 목표달성률 채점 기준(alternatives와 동일 방어)
+  if (it.goal && it.goal.serverId && it.goal.toolName) {
+    const g = { serverId: String(it.goal.serverId), toolName: String(it.goal.toolName) };
+    if (it.goal.params && typeof it.goal.params === 'object' && !Array.isArray(it.goal.params)) g.params = it.goal.params;
+    out.goal = g;
   }
   return out;
 }
@@ -113,6 +141,7 @@ export async function render(container, ctx) {
       el('div', { class: 'panel-title', style: { margin: '0' } }, '벤치마크 세트'));
     const actions = el('div', { class: 'row', style: { gap: '6px', marginBottom: '12px' } },
       el('button', { class: 'btn btn-primary btn-sm', onclick: newSetModal }, '＋ 새 세트'),
+      sets.length ? el('button', { class: 'btn btn-ghost btn-sm', onclick: combineSetsModal }, '⧉ 세트 조합') : null,
       el('button', { class: 'btn btn-ghost btn-sm', onclick: importSet }, '가져오기'));
 
     let listEl;
@@ -185,6 +214,148 @@ export async function render(container, ctx) {
     selectedId = copy.id;
     renderAll();
     toast('세트를 복제했습니다.', 'success');
+  }
+
+  /* ---------- 세트 조합 (여러 세트에서 문항 골라 새 세트 생성) ---------- */
+  function combineSetsModal() {
+    ensureBenchCombineStyles();
+    const sets = getSets();
+    if (!sets.length) { toast('조합할 벤치마크 세트가 없습니다. 먼저 세트를 만드세요.', 'warn'); return; }
+
+    // 선택 상태: "세트id|문항id" 키의 집합 (문항 id가 세트마다 유일하지 않아도 안전)
+    const selKey = (setId, itemId) => setId + '|' + itemId;
+    const selected = new Set();
+
+    const nameI = el('input', { class: 'input', placeholder: '예: 통합 검증 세트' });
+    const descI = el('textarea', { class: 'input', placeholder: '세트 설명(선택)' });
+    const dedupCb = el('input', { type: 'checkbox', checked: true });
+
+    // 하단 선택 개수 표시
+    const totalBadge = el('span', { class: 'badge green' }, '0개 문항 선택');
+    const refreshTotal = () => { totalBadge.textContent = `${selected.size}개 문항 선택`; };
+
+    // 세트별 섹션(전체 선택/해제 헤더 체크박스 + 개별 문항 체크박스)
+    function buildSetSection(set) {
+      const items = set.items || [];
+      const setCb = el('input', { type: 'checkbox' });
+      const itemEntries = []; // { it, cb }
+
+      const refreshHead = () => {
+        const cnt = items.filter(it => selected.has(selKey(set.id, it.id))).length;
+        setCb.checked = items.length > 0 && cnt === items.length;
+        setCb.indeterminate = cnt > 0 && cnt < items.length; // 부분 선택은 property로만 설정
+      };
+
+      // 헤더 체크박스 = 세트 전체 선택/해제
+      setCb.addEventListener('change', () => {
+        const on = setCb.checked;
+        for (const { it, cb } of itemEntries) {
+          cb.checked = on;
+          const k = selKey(set.id, it.id);
+          if (on) selected.add(k); else selected.delete(k);
+        }
+        setCb.indeterminate = false;
+        refreshTotal();
+      });
+
+      const head = el('label', { class: 'rbtl-bc-set-head' },
+        setCb,
+        el('span', { class: 'rbtl-bc-set-name' }, set.name || '(이름 없음)'),
+        badge(`${items.length}문항`, 'dim'));
+
+      let itemsWrap;
+      if (!items.length) {
+        itemsWrap = el('div', { class: 'rbtl-bc-empty' }, '문항이 없습니다.');
+        setCb.disabled = true;
+      } else {
+        itemsWrap = el('div', { class: 'rbtl-bc-items' }, items.map(it => {
+          const cb = el('input', { type: 'checkbox' });
+          cb.addEventListener('change', () => {
+            const k = selKey(set.id, it.id);
+            if (cb.checked) selected.add(k); else selected.delete(k);
+            refreshHead(); refreshTotal();
+          });
+          itemEntries.push({ it, cb });
+          const steps = (it.expected || []).length;
+          return el('label', { class: 'rbtl-bc-item' },
+            cb,
+            el('span', { class: 'rbtl-bc-q', title: it.query }, truncate(it.query, 80)),
+            el('span', { class: 'rbtl-bc-steps' }, `${steps}단계`),
+            badge(DIFF_LABEL[it.difficulty] || it.difficulty || '?', DIFF_KIND[it.difficulty] || 'dim'));
+        }));
+      }
+      return el('div', { class: 'rbtl-bc-set' }, head, itemsWrap);
+    }
+
+    const setsWrap = el('div', { class: 'rbtl-bc-sets' }, sets.map(buildSetSection));
+
+    modal({
+      title: '⧉ 벤치마크 세트 조합',
+      wide: true,
+      body: el('div', {},
+        el('p', { class: 'hint', style: { marginBottom: '14px' } },
+          '여러 벤치마크 세트에서 원하는 문항을 골라 새 세트로 합칩니다. 선택한 문항은 복제되므로 원본 세트는 변경되지 않습니다.'),
+        field({ label: '새 세트 이름', input: nameI, required: true }),
+        field({ label: '설명', input: descI }),
+        field({
+          label: '옵션',
+          input: el('label', { class: 'chk-row' }, dedupCb, el('span', {}, '중복 문항 제거 (동일 질의 또는 동일 워크플로우)')),
+          hint: '같은 질의문이거나 도구 호출 시퀀스가 완전히 같은 문항을 한 번만 포함합니다.',
+        }),
+        el('div', { class: 'row between wrap', style: { gap: '10px', margin: '6px 0 4px' } },
+          el('div', { class: 'panel-title', style: { margin: '0' } }, '조합할 세트 · 문항'),
+          totalBadge),
+        setsWrap),
+      actions: [
+        { label: '취소', class: 'btn-ghost' },
+        {
+          label: '세트 생성', class: 'btn-primary', onClick: () => {
+            const name = nameI.value.trim();
+            if (!name) { toast('세트 이름을 입력하세요.', 'warn'); return false; }
+
+            // 선택된 문항을 화면 표시 순서(세트 순 → 문항 순)대로 수집
+            const picked = [];
+            for (const set of sets) {
+              for (const it of (set.items || [])) {
+                if (selected.has(selKey(set.id, it.id))) picked.push(it);
+              }
+            }
+            if (!picked.length) { toast('포함할 문항을 최소 1개 선택하세요.', 'warn'); return false; }
+
+            // 중복 제거: 동일 query(정규화) 또는 동일 expected 시퀀스 기준
+            const dedupOn = dedupCb.checked;
+            const seenQ = new Set();
+            const seenSeq = new Set();
+            const items = [];
+            for (const it of picked) {
+              const q = String(it.query || '').trim().toLowerCase().replace(/\s+/g, ' ');
+              const seqArr = (it.expected || []).map(s => `${s.serverId}:${s.toolName}`);
+              const seq = seqArr.length ? seqArr.join('>') : null;
+              if (dedupOn && ((q && seenQ.has(q)) || (seq && seenSeq.has(seq)))) continue;
+              if (q) seenQ.add(q);
+              if (seq) seenSeq.add(seq);
+              // 문항 복제: id만 새로 부여(충돌 방지), 나머지 필드(query/expected/category/difficulty/source/notes/ordered/alternatives) 유지
+              items.push({ ...structuredClone(it), id: uuid() });
+            }
+
+            const removed = picked.length - items.length;
+            const set = {
+              id: uuid(),
+              name,
+              description: descI.value.trim(),
+              createdAt: new Date().toISOString(), // 런타임 뷰이므로 사용 가능
+              items,
+            };
+            saveSets([set, ...getSets()]);
+            selectedId = set.id;
+            renderAll();
+            toast(removed > 0
+              ? `세트 "${name}" 생성 — ${items.length}개 문항 (중복 ${removed}개 제거).`
+              : `세트 "${name}" 생성 — ${items.length}개 문항.`, 'success');
+          },
+        },
+      ],
+    });
   }
 
   async function deleteSet(id) {

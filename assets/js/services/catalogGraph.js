@@ -4,9 +4,9 @@
 //
 //  buildGraph({mcps, benchmarks, embedModel, ...})   후보 엣지 전량 계산 → store 'catalogGraph'
 //  graphStatus(mcps, benchmarks, embedModel)         존재/stale/노드수/유형별 엣지수/semantic 사용 여부
-//  effectiveAdjacency(graph, edgeParams)             런타임 파라미터로 유효 가중 인접리스트 구성
-//  graphRetrieve(query, {...})                       시드 → 그래프 확산 → topK 도구 검색
-//  recommendPaths(query, {...})                      io(방향) 엣지 빔서치 워크플로우 경로 추천
+//  effectiveAdjacency(graph, edgeParams, {maxDegree,hubNorm})  런타임 파라미터로 유효 가중 인접리스트 구성
+//  graphRetrieve(query, {..., maxDegree, hubNorm})   시드 → 그래프 확산 → topK 도구 검색
+//  recommendPaths(query, {..., edges, beamWidth, maxLen})  방향(io/llm) 엣지 빔서치 워크플로우 경로 추천
 //
 // 도구 식별자 = `${serverId}/${toolName}`. 노드 목록 = flattenTools(mcps) 순서(등록 순).
 // 임베딩 벡터는 catalogIndex(store 'catalogIndex')를 재사용(semantic 엣지·시드 검색용).
@@ -21,8 +21,11 @@ export const GRAPH_KEY = 'catalogGraph';
 const DEFAULT_EMBED_MODEL = 'bge-m3:latest';
 
 // 과밀 방지 상한
-const IO_OUT_CAP = 12;          // io: 노드당 출력 방향 상위 12개
-const LLM_OUT_CAP = 12;         // llm: 노드당 방향 엣지 상위 12개(io와 동일 정책)
+// §3: 방향 엣지(io/llm)는 빌드 시 "넉넉히" 저장하고, 실제 노드당 상한은 런타임 maxDegree로 축소한다.
+// 이렇게 하면 maxDegree 축소는 재구축 없이 즉시 반영되고, UI 슬라이더 범위(4~30)까지 확대도 재구축 없이 가능하다.
+const IO_STORE_CAP = 30;        // io: 빌드 저장 상한(노드당 출력 방향 상위 30개; 런타임 maxDegree로 축소)
+const LLM_STORE_CAP = 30;       // llm: 빌드 저장 상한(io와 동일 정책)
+const DEFAULT_MAX_DEGREE = 12;  // 런타임 기본 노드당 방향 out-degree 상한(구 IO_OUT_CAP/LLM_OUT_CAP=12와 동일)
 const SEMANTIC_KNN = 8;         // semantic: 노드당 코사인 상위 8개(kNN)
 const CATEGORY_OVERCROWD = 40;  // category: 노드 40개 초과 시 서버 대표 간에만 연결
 const SEMANTIC_STORE_FLOOR = 0.30; // semantic 후보 "저장 하한"(런타임 threshold와 분리 — E3)
@@ -363,8 +366,8 @@ export async function buildGraph({
         // raw는 [0,1]로 클램프(E1): 겹친 키 수가 B의 필수 키 수를 넘어도 1을 초과하지 않게 해 확산 폭주 방지.
         if (overlap > 0) cands.push({ b, raw: round4(Math.min(1, overlap / Math.max(1, B.reqCount))) });
       }
-      cands.sort((x, y) => y.raw - x.raw); // out-degree 상위 12개만
-      for (const c of cands.slice(0, IO_OUT_CAP)) {
+      cands.sort((x, y) => y.raw - x.raw); // out-degree 상위 IO_STORE_CAP개 저장(런타임 maxDegree로 축소)
+      for (const c of cands.slice(0, IO_STORE_CAP)) {
         edges.push({ a, b: c.b, type: 'io', directed: true, raw: c.raw });
       }
     }
@@ -521,7 +524,7 @@ export async function buildGraph({
       }
       onProgress?.({ phase: 'llm', done: i + 1, total: N });
     }
-    // A.produces ∩ B.requires 있으면 방향 엣지 A→B (raw = 겹친 개념 수). io와 동일하게 out-degree 상위 12개.
+    // A.produces ∩ B.requires 있으면 방향 엣지 A→B (raw = 겹친 개념 수). io와 동일하게 out-degree 상위 LLM_STORE_CAP개 저장.
     for (let a = 0; a < N; a++) {
       const prod = new Set(llmConcepts[a]?.produces || []);
       if (!prod.size) continue;
@@ -535,7 +538,7 @@ export async function buildGraph({
         if (overlap > 0) cands.push({ b, raw: overlap });
       }
       cands.sort((x, y) => y.raw - x.raw);
-      for (const c of cands.slice(0, LLM_OUT_CAP)) {
+      for (const c of cands.slice(0, LLM_STORE_CAP)) {
         edges.push({ a, b: c.b, type: 'llm', directed: true, raw: c.raw });
       }
     }
@@ -584,11 +587,17 @@ export async function buildGraph({
  * @param {{io?:{on,weight,threshold}, semantic?:{on,weight,threshold},
  *          server?:{on,weight}, category?:{on,weight}, cooccur?:{on,weight,threshold},
  *          llm?:{on,weight,threshold}}} edgeParams
+ * @param {{maxDegree?:number, hubNorm?:boolean}} [opts] 런타임 파라미터(§3). maxDegree(기본 12): 노드당
+ *   방향(io/llm) out-degree 상한 — 빌드 시 넉넉히 저장한 방향 엣지를 소스별 상위 maxDegree개로 축소한다.
+ *   hubNorm은 확산 시점(graphRetrieve)에서만 쓰이므로 여기서는 받되 인접구조에는 영향을 주지 않는다.
  * @returns {Map<number, Array<{to:number, w:number, type:string, directed:boolean}>>}
  */
-export function effectiveAdjacency(graph, edgeParams = {}) {
+export function effectiveAdjacency(graph, edgeParams = {}, opts = {}) {
   const adj = new Map();
   if (!graph || !Array.isArray(graph.edges)) return adj;
+
+  // 런타임 노드당 방향 out-degree 상한. 미지정 시 12(구 IO_OUT_CAP/LLM_OUT_CAP과 동일 → 회귀 없음).
+  const maxDegree = Number.isFinite(opts.maxDegree) ? Math.max(1, Math.floor(opts.maxDegree)) : DEFAULT_MAX_DEGREE;
 
   // 정수형 raw(cooccur·llm) 정규화용 유형별 최대값
   let cooccurMax = 0, llmMax = 0;
@@ -601,6 +610,10 @@ export function effectiveAdjacency(graph, edgeParams = {}) {
     if (!adj.has(u)) adj.set(u, []);
     adj.get(u).push(entry);
   };
+
+  // 방향 엣지(io/llm)는 소스 노드별로 모아 두었다가 상위 maxDegree개만 채택(런타임 축소).
+  // 무방향 엣지(semantic/server/category/cooccur)는 종전대로 즉시 양방향 push한다.
+  const dirBySource = new Map();
 
   for (const e of graph.edges) {
     const p = edgeParams[e.type];
@@ -620,8 +633,23 @@ export function effectiveAdjacency(graph, edgeParams = {}) {
     const w = weight * norm;
     if (w <= 0) continue;
 
-    push(e.a, { to: e.b, w, type: e.type, directed: !!e.directed });
-    if (!e.directed) push(e.b, { to: e.a, w, type: e.type, directed: false });
+    if (e.directed) {
+      if (!dirBySource.has(e.a)) dirBySource.set(e.a, []);
+      dirBySource.get(e.a).push({ to: e.b, w, type: e.type, directed: true });
+    } else {
+      push(e.a, { to: e.b, w, type: e.type, directed: false });
+      push(e.b, { to: e.a, w, type: e.type, directed: false });
+    }
+  }
+
+  // 방향 엣지 채택: 소스별 상위 maxDegree(가중 내림차순). 상한 이하면 원래 순서를 보존해 회귀를 방지한다.
+  for (const [u, list] of dirBySource) {
+    if (list.length > maxDegree) {
+      list.sort((x, y) => y.w - x.w);
+      for (const entry of list.slice(0, maxDegree)) push(u, entry);
+    } else {
+      for (const entry of list) push(u, entry);
+    }
   }
   return adj;
 }
@@ -664,16 +692,22 @@ async function seedRetrieve(query, { mcps, method, seedK, embedModel, signal, re
  * @param {string} query
  * @param {{mcps:Array, graph:object, edgeParams:object, seedMethod?:string, seedK?:number,
  *          hops?:number, decay?:number, topK?:number, embedModel?:string,
- *          signal?:AbortSignal}} opts
- * @returns {Promise<{results:Array, seeds:Array, usedEmbed:boolean, fallbackReason:string|null}>}
+ *          maxDegree?:number, hubNorm?:boolean, signal?:AbortSignal}} opts
+ *   maxDegree(기본 12): effectiveAdjacency의 노드당 방향 out-degree 상한(런타임 축소).
+ *   hubNorm(기본 true): 확산 기여를 허브 정규화(w/√deg)할지 여부. false면 정규화 없이 w 그대로(현행=true).
+ * @returns {Promise<{results:Array, seeds:Array, relevance:Map<string,number>, usedEmbed:boolean, fallbackReason:string|null}>}
+ *   relevance: 시드 검색에서 이미 계산한 (더 넓은) 질의 관련도 맵(`serverId/toolName`→0~1).
+ *   recommendPaths에 그대로 넘기면 시드 이중 임베딩(질의 임베딩 2회)을 피할 수 있다(하위호환: 추가 필드).
  */
 export async function graphRetrieve(query, {
   mcps = [], graph, edgeParams = {}, seedMethod = 'hybrid', seedK = 5, hops = 2,
-  decay = 0.5, topK = 8, embedModel = DEFAULT_EMBED_MODEL, signal,
+  decay = 0.5, topK = 8, embedModel = DEFAULT_EMBED_MODEL, maxDegree, hubNorm, signal,
 } = {}) {
   const q = String(query || '').trim();
   const k = Math.max(1, Math.floor(topK) || 8);
   embedModel = embedModel || DEFAULT_EMBED_MODEL; // config에서 null이 넘어오면 임베딩 기본값
+  const md = Number.isFinite(maxDegree) ? Math.max(1, Math.floor(maxDegree)) : DEFAULT_MAX_DEGREE;
+  const hn = hubNorm === undefined ? true : !!hubNorm; // 허브 정규화(1/√deg) 기본 on(현행)
   const gnodes = (graph && Array.isArray(graph.nodes)) ? graph.nodes : [];
   const keyToNode = new Map(gnodes.map((n, i) => [`${n.serverId}/${n.toolName}`, i]));
 
@@ -683,7 +717,8 @@ export async function graphRetrieve(query, {
     seedInfo = await seedRetrieve(q, { mcps, method: seedMethod, seedK, embedModel, signal, relevanceK: SEED_RELEVANCE_K });
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
-    return { results: [], seeds: [], usedEmbed: false, fallbackReason: `시드 검색 실패: ${e.message}` };
+    // relevance 필드는 실패 경로에서도 항상 포함해 반환 형태를 일정하게 유지(소비자 방어).
+    return { results: [], seeds: [], relevance: new Map(), usedEmbed: false, fallbackReason: `시드 검색 실패: ${e.message}` };
   }
   const usedEmbed = seedInfo.usedMethod !== 'keyword';
   let fallbackReason = seedInfo.fallbackReason;
@@ -703,7 +738,7 @@ export async function graphRetrieve(query, {
   }
 
   // 2) 그래프 확산 (개인화 PageRank의 유한 홉 근사)
-  const adj = effectiveAdjacency(graph, edgeParams);
+  const adj = effectiveAdjacency(graph, edgeParams, { maxDegree: md });
   // 허브 과증폭 완화(E6): 목표 노드의 유효 in-degree(들어오는 엣지 수) 제곱근으로 이웃 기여를 정규화.
   // 많은 이웃에서 도달되는 공용 커넥터(예: 공유 date/trainNo)일수록 per-edge 기여를 줄인다(대칭 정규화 근사).
   const inDeg = new Map();
@@ -730,7 +765,8 @@ export async function graphRetrieve(query, {
             ioMul = sameServer ? IO_SAME_SERVER_MUL
               : xserverIoMul(h === 1 ? IO_XSERVER_HOP1_MUL : IO_XSERVER_MUL, relByNode.get(nb.to));
           }
-          const add = act * d * nb.w * ioMul / Math.sqrt(Math.max(1, inDeg.get(nb.to) || 1));
+          // hubNorm이면 목표 노드 in-degree √로 정규화(허브 과증폭 완화), 아니면 정규화 없이 w 그대로.
+          const add = act * d * nb.w * ioMul / (hn ? Math.sqrt(Math.max(1, inDeg.get(nb.to) || 1)) : 1);
           if (add <= 1e-9) continue;
           next.set(nb.to, (next.get(nb.to) || 0) + add);
           graphScore.set(nb.to, (graphScore.get(nb.to) || 0) + add);
@@ -777,7 +813,8 @@ export async function graphRetrieve(query, {
   if (!gnodes.length) fallbackReason = fallbackReason || '그래프가 없어 시드 검색 결과만 반환';
   else if (!adj.size) fallbackReason = fallbackReason || '유효 엣지가 없어(엣지 off/임계값) 시드 검색 결과만 반환';
 
-  return { results, seeds: seedList, usedEmbed, fallbackReason };
+  // relevance는 recommendPaths가 시드 재계산 없이 재사용하도록 그대로 노출(추가 필드 — 기존 소비자 무영향).
+  return { results, seeds: seedList, relevance: seedInfo.relevance, usedEmbed, fallbackReason };
 }
 
 /* ============================================================
@@ -789,22 +826,36 @@ export async function graphRetrieve(query, {
  * io는 스키마 입출력 연결, llm은 LLM이 추출한 의미 관계(둘 다 방향 A→B)이므로 경로에 함께 쓸 수 있다.
  * @param {string} query
  * @param {{mcps:Array, graph:object, edgeParams:object, seedMethod?:string, seedK?:number,
- *          maxLen?:number, pathEdges?:Array<'io'|'llm'>, embedModel?:string, signal?:AbortSignal}} opts
- *   pathEdges 기본 ['io']. ['io','llm'] 등으로 경로 탐색 대상 방향 엣지 유형을 지정(해당 엣지가 on이어야 함).
+ *          maxLen?:number, edges?:Array<'io'|'llm'>, pathEdges?:Array<'io'|'llm'>,
+ *          beamWidth?:number, maxDegree?:number, embedModel?:string,
+ *          seeds?:Array, relevance?:Map<string,number>, signal?:AbortSignal}} opts
+ *   §3: edges(신규, 기본 ['io']; ['io','llm'] 허용)로 경로 탐색 대상 방향 엣지 유형 지정(해당 엣지 on 필요).
+ *   구 인자 pathEdges도 병행 지원(하위호환): edges 미지정 시 pathEdges를 사용.
+ *   beamWidth(기본=현행 PATH_BEAM=10, 미지정 시): 빔 서치 폭. maxLen(기본 4): 최대 경로 노드 길이.
+ *   seeds/relevance(선택): graphRetrieve가 이미 계산한 시드/질의 관련도 맵. relevance(비어있지 않은 Map)를
+ *   넘기면 내부 시드 검색(질의 임베딩)을 건너뛰고 그 관련도로 빔서치를 시작한다(시드 이중 임베딩 제거).
+ *   미제공(직접 호출·편집기 미리보기 등) 시에는 기존대로 자체 seedRetrieve를 수행한다(100% 하위호환).
  * @returns {Promise<{paths:Array<{steps:Array<{serverId,toolName}>, score:number}>, note:string|null}>}
  */
 export async function recommendPaths(query, {
   mcps = [], graph, edgeParams = {}, seedMethod = 'hybrid', seedK = 3, maxLen = 4,
-  pathEdges = ['io'], embedModel = DEFAULT_EMBED_MODEL, signal,
+  pathEdges = ['io'], edges, beamWidth, maxDegree, embedModel = DEFAULT_EMBED_MODEL,
+  seeds, relevance: providedRelevance, signal,
 } = {}) {
   embedModel = embedModel || DEFAULT_EMBED_MODEL; // config에서 null이 넘어오면 임베딩 기본값
+  // edges(신규)가 우선, 없으면 pathEdges(하위호환), 둘 다 없으면 ['io'].
+  const effEdges = (Array.isArray(edges) && edges.length) ? edges
+    : (Array.isArray(pathEdges) && pathEdges.length ? pathEdges : ['io']);
+  // beamWidth 미지정 시 현행 PATH_BEAM(10) — 회귀 방지. 지정 시 1~20으로 클램프.
+  const beamW = Number.isFinite(beamWidth) ? Math.max(1, Math.min(20, Math.floor(beamWidth))) : PATH_BEAM;
+  const md = Number.isFinite(maxDegree) ? Math.max(1, Math.floor(maxDegree)) : DEFAULT_MAX_DEGREE;
   const gnodes = (graph && Array.isArray(graph.nodes)) ? graph.nodes : [];
   const keyToNode = new Map(gnodes.map((n, i) => [`${n.serverId}/${n.toolName}`, i]));
 
-  // 방향 엣지(pathEdges) 인접리스트만 추출 — io는 항상, llm은 지정 시. 둘 다 directed=true.
-  const allow = new Set((Array.isArray(pathEdges) && pathEdges.length ? pathEdges : ['io']).filter(t => t === 'io' || t === 'llm'));
+  // 방향 엣지(effEdges) 인접리스트만 추출 — io는 항상, llm은 지정 시. 둘 다 directed=true.
+  const allow = new Set((Array.isArray(effEdges) && effEdges.length ? effEdges : ['io']).filter(t => t === 'io' || t === 'llm'));
   if (!allow.size) allow.add('io');
-  const adj = effectiveAdjacency(graph, edgeParams);
+  const adj = effectiveAdjacency(graph, edgeParams, { maxDegree: md });
   const dirAdj = new Map();
   let dirCount = 0;
   for (const [u, list] of adj) {
@@ -822,14 +873,22 @@ export async function recommendPaths(query, {
   }
 
   // 시드 (+ 넓은 질의 관련도 맵) — 경로 시작/점수에 관련도 맵을 사용한다.
+  // 호출측이 관련도 맵(relevance)이나 시드(seeds)를 넘기면 내부 시드 검색(질의 임베딩)을 건너뛴다(시드 이중 임베딩 제거).
+  // 우선순위: relevance(넓은 관련도 맵) > seeds(시드에서 축약 관련도 구성) > 자체 seedRetrieve(미제공 시 기존 동작·하위호환).
   let relevance;
-  try {
-    const info = await seedRetrieve(String(query || '').trim(),
-      { mcps, method: seedMethod, seedK, embedModel, signal, relevanceK: SEED_RELEVANCE_K });
-    relevance = info.relevance;
-  } catch (e) {
-    if (e?.name === 'AbortError') throw e;
-    return { paths: [], note: `시드 검색 실패: ${e.message}` };
+  if (providedRelevance instanceof Map && providedRelevance.size) {
+    relevance = providedRelevance;
+  } else if (Array.isArray(seeds) && seeds.length) {
+    relevance = new Map(seeds.map(s => [`${s.serverId}/${s.toolName}`, Number(s.score) || 0]));
+  } else {
+    try {
+      const info = await seedRetrieve(String(query || '').trim(),
+        { mcps, method: seedMethod, seedK, embedModel, signal, relevanceK: SEED_RELEVANCE_K });
+      relevance = info.relevance;
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      return { paths: [], note: `시드 검색 실패: ${e.message}` };
+    }
   }
   const relByNode = new Map();
   for (const [key, sc] of relevance) if (keyToNode.has(key)) relByNode.set(keyToNode.get(key), sc);
@@ -884,7 +943,7 @@ export async function recommendPaths(query, {
       if (!next.length) break;
       // 빔 정렬을 길이정규화 블렌드 점수로 → 관련 노드(예: 예매 질의의 예약 도구)가 가지치기에서 생존
       next.sort((a, b) => pathScore(b.nodes, b.edgeSum) - pathScore(a.nodes, a.edgeSum));
-      beam = next.slice(0, PATH_BEAM);
+      beam = next.slice(0, beamW);
       for (const p of beam) {
         const key = p.nodes.join('>');
         const sc = pathScore(p.nodes, p.edgeSum);

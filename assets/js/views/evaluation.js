@@ -17,15 +17,172 @@ const DIFF_KIND = { easy: 'green', medium: 'amber', hard: 'red' };
 const STATUS_LABEL = { running: '실행 중', done: '완료', cancelled: '중단됨', error: '오류' };
 const STATUS_KIND = { running: 'blue', done: 'green', cancelled: 'amber', error: 'red' };
 
-/** 리더보드 정렬 기준 (asc=오름차순) */
+/** 리더보드 정렬 기준 (asc=오름차순) — 기본은 종합점수 내림차순 */
 const SORT_OPTS = [
+  { key: 'orchestrationScore', label: '종합점수', asc: false },
+  { key: 'avgComposite', label: '품질점수', asc: false },
   { key: 'avgF1', label: 'F1', asc: false },
+  { key: 'goalAchievementRate', label: '목표달성률', asc: false },
+  { key: 'avgCallSuccessRate', label: '도구성공률', asc: false },
+  { key: 'avgExtraToolRate', label: '잉여호출률(오름차순)', asc: true },
   { key: 'avgPrecision', label: 'Precision', asc: false },
   { key: 'avgRecall', label: 'Recall', asc: false },
   { key: 'avgSeqAccuracy', label: '시퀀스', asc: false },
   { key: 'exactMatchRate', label: '완전일치', asc: false },
+  { key: 'avgParamScore', label: '파라미터', asc: false },
+  { key: 'avgTotalTokens', label: '평균 총토큰(오름차순)', asc: true },
   { key: 'avgLatencyMs', label: '평균 지연(오름차순)', asc: true },
 ];
+
+/**
+ * 지표 사전 — 컬럼 헤더 hover(title) 툴팁 + 용어집 패널 공용.
+ * dir: 'up'=높을수록 좋음, 'down'=낮을수록 좋음.
+ */
+const METRIC_INFO = {
+  orchestrationScore: {
+    name: '오케스트레이션 종합점수', dir: 'up',
+    meaning: '전략의 최종 순위를 정하는 헤드라인 점수. 워크플로우 품질과 토큰 효율을 함께 반영합니다. 토큰효율이 상대 지표라 동일 run(실행) 내에서만 비교되는 점수입니다(run 간 비교 불가).',
+    formula: '0.85 × 품질점수 + 0.15 × 토큰효율',
+  },
+  compositeScore: {
+    name: '품질점수(종합 품질)', dir: 'up',
+    meaning: '토큰을 빼고 오직 워크플로우가 얼마나 정확했는지만 본 점수입니다. 구성 지표가 N/A(예: 도구 미호출·목표 특정 불가)이면 그 가중치를 제외하고 남은 가중치로 재정규화합니다.',
+    formula: '0.4 × F1 + 0.3 × 목표달성 + 0.15 × 도구성공률 + 0.15 × 파라미터정확도 (N/A 항목은 가중치 제외 후 재정규화)',
+  },
+  tokenEfficiency: {
+    name: '토큰 효율', dir: 'up',
+    meaning: '함께 평가한 전략들 중 토큰을 적게 쓸수록 높은 비율 기반 상대 지표입니다. 가장 적게 쓴 전략이 1이고, 그 전략 대비 토큰을 많이 쓸수록 낮아집니다. 함께 평가한 전략 집합에 상대적이라 run 간 비교는 불가하며, 단일 전략만 평가하면 1입니다.',
+    formula: '가장 적은 평균총토큰 / 이 전략의 평균총토큰 (최소·단일 전략 = 1)',
+  },
+  f1: {
+    name: 'F1 점수', dir: 'up',
+    meaning: '호출한 도구 집합이 정답 도구 집합과 얼마나 겹치는지의 종합 점수(정밀도와 재현율의 조화평균).',
+    formula: '2 × 정밀도 × 재현율 / (정밀도 + 재현율)',
+  },
+  precision: {
+    name: '정밀도(Precision)', dir: 'up',
+    meaning: '내가 호출한 도구 중 실제로 정답에 있던 도구의 비율. 낮으면 쓸데없는 도구를 많이 불렀다는 뜻.',
+    formula: '정답에 포함된 호출 수 / 전체 호출 수',
+  },
+  recall: {
+    name: '재현율(Recall)', dir: 'up',
+    meaning: '정답 도구 중 내가 실제로 호출한 비율. 낮으면 필요한 도구를 빠뜨렸다는 뜻.',
+    formula: '호출한 정답 도구 수 / 전체 정답 도구 수',
+  },
+  seqAccuracy: {
+    name: '시퀀스 정확도', dir: 'up',
+    meaning: '도구를 부른 순서가 기대 순서와 얼마나 맞는지. 순서가 중요한 워크플로우에서 의미가 큽니다.',
+    formula: '정답 순서와 일치하는 최장 공통 부분수열 기반 비율',
+  },
+  exactMatch: {
+    name: '완전일치율', dir: 'up',
+    meaning: '기대 워크플로우와 도구·순서가 완전히 똑같이 실행된 문항의 비율.',
+    formula: '완전히 일치한 문항 수 / 전체 문항 수',
+  },
+  paramScore: {
+    name: '파라미터 정확도', dir: 'up',
+    meaning: '도구를 부를 때 넘긴 인자(from·date 등)가 정답 파라미터와 얼마나 일치하는지. 도구는 맞아도 인자가 틀리면 낮아집니다.',
+    formula: '일치한 파라미터 키·값 비율의 평균',
+  },
+  goalAchieved: {
+    name: '목표 달성률', dir: 'up',
+    meaning: '기대 워크플로우의 최종(목표) 도구를 오류 없이 호출한 문항의 비율입니다(파라미터가 지정된 경우 절반 이상 일치해야 인정). "일을 실제로 끝냈는가"를 봅니다. 단, 순서 무관(ordered:false) 항목에서 목표를 지정하지 않으면 정답 도구 전부를 오류 없이 호출해야 달성으로 인정합니다(집합 완수). 목표를 특정할 수 없는 문항은 N/A로 제외합니다.',
+    formula: '목표도구를 오류 없이·파라미터 매칭≥0.5로 부른 문항 / 목표를 특정할 수 있는 문항 (순서 무관·목표 미지정 시 정답 도구 전부 완수)',
+  },
+  callSuccessRate: {
+    name: '도구 호출 성공률', dir: 'up',
+    meaning: '호출한 도구 중 입력 스키마 검증·실행에 성공한 비율. 낮으면 파라미터를 잘못 만들어 호출이 실패했다는 뜻.',
+    formula: '(전체 호출 − 실패 호출) / 전체 호출',
+  },
+  extraToolRate: {
+    name: '잉여 도구 호출률', dir: 'down',
+    meaning: '정답에 없는 불필요한 도구를 부른 비율. 정밀도의 반대 개념입니다.',
+    formula: '1 − 정밀도',
+  },
+  inputTokens: {
+    name: '입력 토큰', dir: 'down',
+    meaning: 'LLM에 보낸 프롬프트의 토큰 수. 프롬프트·컨텍스트가 길수록 큽니다. "≈"는 서버가 실측값을 주지 않아 글자수로 추정한 값.',
+    formula: 'prompt_eval_count 합(없으면 글자수/2.2 추정)',
+  },
+  outputTokens: {
+    name: '출력 토큰', dir: 'down',
+    meaning: 'LLM이 생성한 응답의 토큰 수.',
+    formula: 'eval_count 합(없으면 글자수/2.2 추정)',
+  },
+  totalTokens: {
+    name: '총 토큰(평균)', dir: 'down',
+    meaning: '문항당 입력+출력 토큰의 평균. 적을수록 비용·지연이 낮습니다.',
+    formula: '평균 입력 토큰 + 평균 출력 토큰',
+  },
+  avgLatencyMs: {
+    name: '평균 지연', dir: 'down',
+    meaning: '문항 1개를 처리하는 데 걸린 평균 시간.',
+    formula: '문항별 실행 시간의 평균',
+  },
+  avgLlmCalls: {
+    name: 'LLM 호출 수', dir: 'down',
+    meaning: '문항당 평균 LLM 호출 횟수. 많을수록 반복 추론(react류)이 많다는 뜻.',
+    formula: '문항별 LLM 호출 횟수의 평균',
+  },
+  errorRate: {
+    name: '오류율', dir: 'down',
+    meaning: '부분 오류까지 포함한 실패 비율. react류는 단계 오류에서 회복할 수 있어 실행 실패율과 함께 봐야 합니다.',
+    formula: '오류가 있었던 문항(단계 포함) / 전체 문항',
+  },
+};
+
+/** 방향 설명 텍스트 */
+function dirText(dir) { return dir === 'up' ? '높을수록 좋음' : '낮을수록 좋음'; }
+
+/** 컬럼 헤더 hover 툴팁 문자열 (title 속성) */
+function infoTitle(key) {
+  const i = METRIC_INFO[key];
+  if (!i) return '';
+  return `${i.name} — ${i.meaning}\n계산식: ${i.formula}\n(${dirText(i.dir)})`;
+}
+
+/** 설명 툴팁이 붙은 표 헤더 셀 */
+function thHelp(label, key) { return el('th', { class: 'th-help', title: infoTitle(key) }, label); }
+
+/** 토큰 수 포맷(정수·천단위 구분). null이면 '-' */
+function fmtTok(v) { return v == null ? '-' : Math.round(v).toLocaleString('ko-KR'); }
+
+/** 비율(0~1) 포맷 — null/NaN이면 '-'(N/A). goalAchievementRate 등 목표 특정 불가로 N/A 가능한 지표용 */
+function fmtRate(v) { return (v == null || Number.isNaN(v)) ? '-' : fmt.pct(v); }
+
+/** 평가 화면 확장 스타일 1회 주입 (main.css는 수정하지 않음) */
+function injectEvalStyles() {
+  if (document.getElementById('rbtl-eval-ext')) return;
+  const style = el('style', { id: 'rbtl-eval-ext' });
+  style.textContent = `
+/* 평가 화면 확장 — 용어집/헤더 툴팁/토큰 (main.css 미수정, 1회 주입) */
+.tbl th.th-help { cursor: help; text-decoration: underline dotted var(--tx3); text-underline-offset: 3px; white-space: nowrap; }
+.tok-cell { display: inline-flex; align-items: center; gap: 4px; justify-content: flex-end; }
+.tok-cell .tok-est { color: var(--sig-amber); font-weight: 600; }
+.eval-glossary > summary { list-style: none; cursor: pointer; display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 2px 0; user-select: none; }
+.eval-glossary > summary::-webkit-details-marker { display: none; }
+.eval-glossary > summary::before { content: '▸'; color: var(--sig-green); font-size: 12px; display: inline-block; transition: transform .15s; }
+.eval-glossary[open] > summary::before { transform: rotate(90deg); }
+.eval-glossary .gl-summary-title { font-size: 14px; font-weight: 600; color: var(--tx0); }
+.eval-glossary .gl-summary-hint { font-size: 11.5px; color: var(--tx2); }
+.eval-glossary .gl-body { margin-top: 14px; display: flex; flex-direction: column; gap: 16px; }
+.eval-glossary .gl-hero { background: var(--sig-green-dim); border: 1px solid rgba(49,208,124,.28); border-radius: var(--r2); padding: 14px 16px; }
+.eval-glossary .gl-hero-title { font-size: 12.5px; font-weight: 600; color: var(--tx0); margin-bottom: 8px; }
+.eval-glossary .gl-hero-formula { font-family: var(--font-mono); font-size: 13px; color: var(--tx0); line-height: 1.5; overflow-x: auto; }
+.eval-glossary .gl-hero-formula b { color: var(--sig-green); font-weight: 600; }
+.eval-glossary .gl-hero-note { font-size: 11.5px; color: var(--tx2); margin-top: 10px; line-height: 1.5; }
+.eval-glossary .gl-section-title { font-size: 11px; letter-spacing: .12em; color: var(--tx3); font-family: var(--font-mono); margin-bottom: 8px; text-transform: uppercase; }
+.eval-glossary .gl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+.eval-glossary .gl-item { background: var(--bg0); border: 1px solid var(--line-soft); border-radius: var(--r1); padding: 11px 13px; }
+.eval-glossary .gl-name { font-size: 13px; font-weight: 600; color: var(--tx0); }
+.eval-glossary .gl-mean { font-size: 12px; color: var(--tx1); line-height: 1.55; margin-top: 5px; }
+.eval-glossary .gl-formula { font-family: var(--font-mono); font-size: 11px; color: var(--tx2); background: var(--bg2); border: 1px solid var(--line-soft); border-radius: 4px; padding: 5px 7px; margin-top: 7px; overflow-x: auto; white-space: nowrap; }
+.eval-glossary .gl-dir { display: inline-block; font-size: 11px; font-weight: 600; margin-top: 7px; }
+.eval-glossary .gl-dir.up { color: var(--sig-green); }
+.eval-glossary .gl-dir.down { color: var(--sig-amber); }
+`;
+  document.head.appendChild(style);
+}
 
 function typeBadge(type) { return badge(TYPE_LABEL[type] || type || '?', TYPE_KIND[type] || 'dim'); }
 
@@ -82,6 +239,7 @@ function orderedStrategies(run) {
    진입점
    ============================================================ */
 export async function render(container, ctx) {
+  injectEvalStyles();
   const mcps = store.get('mcps') || [];
 
   const runId = ctx?.params?.runId;
@@ -415,7 +573,7 @@ export async function render(container, ctx) {
     root.appendChild(buildInsight(baseStrat));
 
     /* 2·3. 리더보드 + 차트 — 정렬 기준 변경 시 표·차트 시리즈 순서 동기화 */
-    let sortKey = 'avgF1';
+    let sortKey = 'orchestrationScore'; // 기본 정렬 = 오케스트레이션 종합점수 내림차순
     const leaderBox = el('div', {});
     const chartsBox = el('div', {});
     function sortStrat() {
@@ -434,18 +592,67 @@ export async function render(container, ctx) {
     root.appendChild(leaderBox);
     root.appendChild(chartsBox);
 
+    /* 3.5 지표 설명(용어집) — 접이식 */
+    root.appendChild(buildGlossary());
+
     /* 4. 항목별 상세 (기본 F1 순) */
     root.appendChild(buildDetail(run, baseStrat));
 
     return root;
   }
 
+  /* ---------- 지표 설명 (용어집) — 접이식 패널 ---------- */
+  function buildGlossary() {
+    const item = (key) => {
+      const info = METRIC_INFO[key];
+      if (!info) return null;
+      return el('div', { class: 'gl-item' },
+        el('div', { class: 'gl-name' }, info.name),
+        el('div', { class: 'gl-mean' }, info.meaning),
+        el('div', { class: 'gl-formula' }, '계산식: ' + info.formula),
+        el('span', { class: 'gl-dir ' + info.dir }, info.dir === 'up' ? '▲ 높을수록 좋음' : '▼ 낮을수록 좋음'));
+    };
+    const section = (title, keys) => el('div', {},
+      el('div', { class: 'gl-section-title' }, title),
+      el('div', { class: 'gl-grid' }, keys.map(item)));
+
+    const hero = el('div', { class: 'gl-hero' },
+      el('div', { class: 'gl-hero-title' }, '오케스트레이션 종합점수 공식'),
+      el('div', { class: 'gl-hero-formula' },
+        el('div', {}, '종합점수 = ', el('b', {}, '0.85 × 품질'), ' + ', el('b', {}, '0.15 × 토큰효율')),
+        el('div', { style: { marginTop: '6px' } }, '품질 = 0.4 × F1 + 0.3 × 목표달성 + 0.15 × 도구성공률 + 0.15 × 파라미터정확도')),
+      el('div', { class: 'gl-hero-note' }, '토큰효율은 가장 적게 쓴 전략(=1) 대비 토큰을 많이 쓸수록 낮아지는 비율 기반 상대 지표입니다. 함께 평가한 전략 집합에 상대적이라 run 간 비교는 불가하며, 단일 전략만 평가하면 1로 처리됩니다. 품질점수는 구성 지표가 N/A이면 그 가중치를 빼고 재정규화합니다.'));
+
+    return el('div', { class: 'card', style: { marginBottom: '16px' } },
+      el('details', { class: 'eval-glossary' },
+        el('summary', {},
+          el('span', { class: 'gl-summary-title' }, '📖 지표 설명 (용어집)'),
+          el('span', { class: 'gl-summary-hint' }, '처음 보는 지표의 의미·계산식·해석을 펼쳐 확인하세요')),
+        el('div', { class: 'gl-body' },
+          hero,
+          section('종합 지표', ['orchestrationScore', 'compositeScore', 'tokenEfficiency']),
+          section('도구 선택 정확도', ['f1', 'precision', 'recall']),
+          section('순서 · 완전성', ['seqAccuracy', 'exactMatch']),
+          section('파라미터 · 목표 달성', ['paramScore', 'goalAchieved', 'callSuccessRate', 'extraToolRate']),
+          section('토큰 사용량', ['inputTokens', 'outputTokens', 'totalTokens']),
+          section('실행 비용 · 안정성', ['avgLatencyMs', 'avgLlmCalls', 'errorRate']))));
+  }
+
   /* ---------- 인사이트 한 줄 ---------- */
   function buildInsight(strat) {
     const parts = [];
+    // 헤드라인은 종합점수 — 최고 종합점수 전략을 가장 먼저 언급(F1은 구성 지표 중 하나일 뿐)
+    const byScore = [...strat].sort((a, b) => (b.summary.orchestrationScore || 0) - (a.summary.orchestrationScore || 0));
+    const bestScore = byScore[0];
     const byF1 = [...strat].sort((a, b) => (b.summary.avgF1 || 0) - (a.summary.avgF1 || 0));
     const bestF1 = byF1[0];
+    if (bestScore?.summary.orchestrationScore != null) parts.push(`최고 종합점수는 “${bestScore.strategyName}” (${fmt.pct(bestScore.summary.orchestrationScore)})`);
     parts.push(`최고 F1은 “${bestF1.strategyName}” (${fmt.pct(bestF1.summary.avgF1)})`);
+    // 최고 목표달성률 — N/A(목표 특정 불가) 전략은 제외하고 비교
+    const byGoal = [...strat]
+      .filter((s) => s.summary.goalAchievementRate != null && !Number.isNaN(s.summary.goalAchievementRate))
+      .sort((a, b) => (b.summary.goalAchievementRate || 0) - (a.summary.goalAchievementRate || 0));
+    if (byGoal.length) parts.push(`최고 목표달성률은 “${byGoal[0].strategyName}” (${fmtRate(byGoal[0].summary.goalAchievementRate)})`);
     if (strat.length > 1) {
       const fastest = [...strat].sort((a, b) => (a.summary.avgLatencyMs || 0) - (b.summary.avgLatencyMs || 0))[0];
       const bestExact = [...strat].sort((a, b) => (b.summary.exactMatchRate || 0) - (a.summary.exactMatchRate || 0))[0];
@@ -474,10 +681,21 @@ export async function render(container, ctx) {
   }
 
   /* ---------- 리더보드 ---------- */
-  function buildLeaderboard(strat, sortKey = 'avgF1', onSortChange) {
-    const metricBar = (v) => el('div', { class: 'metric-bar' },
-      el('div', { class: 'mb-track' }, el('div', { class: 'mb-fill', style: { width: Math.max(0, Math.min(1, v || 0)) * 100 + '%' } })),
+  function buildLeaderboard(strat, sortKey = 'orchestrationScore', onSortChange) {
+    const metricBar = (v, fill) => el('div', { class: 'metric-bar' },
+      el('div', { class: 'mb-track' }, el('div', { class: 'mb-fill', style: { width: Math.max(0, Math.min(1, v || 0)) * 100 + '%', ...(fill ? { background: fill } : {}) } })),
       el('span', { class: 'mb-val' }, fmt.pct(v)));
+    // 종합점수는 F1(초록)과 구분되도록 보라~파랑 그라데이션 막대. 값이 없으면 '-'
+    const scoreCell = (v) => v == null
+      ? el('td', { class: 'metric-cell num', style: { color: 'var(--tx3)' } }, '-')
+      : el('td', { class: 'metric-cell' }, metricBar(v, 'linear-gradient(90deg,#a78bfa,#4da3ff)'));
+    // 평균 총토큰 셀 — 추정치 포함 시 ≈ 배지
+    const tokenCell = (m) => m.avgTotalTokens == null
+      ? el('td', { class: 'num', style: { color: 'var(--tx3)' } }, '-')
+      : el('td', { class: 'num', title: m.anyTokensEstimated ? '실측값이 없어 글자수 기반으로 추정한 값을 포함합니다.' : '' },
+          el('span', { class: 'tok-cell' },
+            m.anyTokensEstimated ? el('span', { class: 'tok-est' }, '≈') : null,
+            fmtTok(m.avgTotalTokens)));
 
     const rows = strat.map((s, i) => {
       const m = s.summary;
@@ -495,12 +713,20 @@ export async function render(container, ctx) {
       return el('tr', {},
         el('td', {}, el('span', { class: 'leader-rank' + (i === 0 ? ' r1' : '') }, String(i + 1))),
         nameCell,
+        scoreCell(m.orchestrationScore),
         el('td', { class: 'metric-cell' }, metricBar(m.avgF1)),
+        el('td', { class: 'num' }, fmtRate(m.goalAchievementRate)),
+        el('td', { class: 'num' }, fmt.pct(m.avgCallSuccessRate)),
+        el('td', {
+          class: 'num',
+          style: { color: (m.avgExtraToolRate ?? 0) > 0 ? 'var(--sig-amber)' : 'var(--tx2)' },
+        }, fmt.pct(m.avgExtraToolRate)),
         el('td', { class: 'num' }, fmt.pct(m.avgPrecision)),
         el('td', { class: 'num' }, fmt.pct(m.avgRecall)),
         el('td', { class: 'num' }, fmt.pct(m.avgSeqAccuracy)),
         el('td', { class: 'num' }, fmt.pct(m.exactMatchRate)),
         el('td', { class: 'num' }, m.avgParamScore == null ? '-' : fmt.pct(m.avgParamScore)),
+        tokenCell(m),
         el('td', { class: 'num' }, fmt.ms(m.avgLatencyMs)),
         el('td', { class: 'num' }, fmt.num(m.avgLlmCalls, 1)),
         el('td', {
@@ -520,10 +746,15 @@ export async function render(container, ctx) {
       el('div', { class: 'tbl-wrap' },
         el('table', { class: 'tbl' },
           el('thead', {}, el('tr', {},
-            el('th', {}, '순위'), el('th', {}, '전략'), el('th', {}, 'F1'),
-            el('th', {}, 'Precision'), el('th', {}, 'Recall'), el('th', {}, '시퀀스'),
-            el('th', {}, '완전일치'), el('th', {}, '파라미터'), el('th', {}, '평균 지연'),
-            el('th', {}, 'LLM'), el('th', {}, '오류율'))),
+            el('th', {}, '순위'), el('th', {}, '전략'),
+            thHelp('종합점수', 'orchestrationScore'), thHelp('F1', 'f1'),
+            thHelp('목표달성', 'goalAchieved'), thHelp('도구성공', 'callSuccessRate'),
+            thHelp('잉여호출', 'extraToolRate'),
+            thHelp('Precision', 'precision'), thHelp('Recall', 'recall'),
+            thHelp('시퀀스', 'seqAccuracy'), thHelp('완전일치', 'exactMatch'),
+            thHelp('파라미터', 'paramScore'), thHelp('평균토큰', 'totalTokens'),
+            thHelp('평균 지연', 'avgLatencyMs'), thHelp('LLM', 'avgLlmCalls'),
+            thHelp('오류율', 'errorRate'))),
           el('tbody', {}, rows))));
   }
 
@@ -583,7 +814,27 @@ export async function render(container, ctx) {
         strat.length > 1 ? segmented(strat.map((s) => ({ label: s.strategyName, value: s.id })), selId, (v) => { selId = v; renderDiff(); }) : null),
       diffBox);
 
-    return el('div', { class: 'grid cols-2', style: { marginBottom: '16px' } }, barCard, radarCard, latCard, diffCard);
+    // (e) 전략별 토큰 사용량 (평균 입력/출력) — 토큰 데이터가 있을 때만
+    const hasTokens = strat.some((s) => (s.summary.avgTotalTokens ?? 0) > 0
+      || s.summary.avgInputTokens != null || s.summary.avgOutputTokens != null);
+    let tokenCard = null;
+    if (hasTokens) {
+      const tokenGroups = [
+        { label: '평균 입력 토큰', values: strat.map((s) => s.summary.avgInputTokens || 0) },
+        { label: '평균 출력 토큰', values: strat.map((s) => s.summary.avgOutputTokens || 0) },
+      ];
+      const tokMax = Math.max(1, ...strat.flatMap((s) => [s.summary.avgInputTokens || 0, s.summary.avgOutputTokens || 0]));
+      const anyEst = strat.some((s) => s.summary.anyTokensEstimated);
+      tokenCard = el('div', { class: 'card' },
+        el('div', { class: 'panel-title' }, '전략별 토큰 사용량',
+          anyEst ? el('span', { class: 'sub', style: { color: 'var(--sig-amber)' } }, '≈ 추정치 포함') : null),
+        groupedBarChart(tokenGroups, series, { max: tokMax, fmtVal: (v) => Math.round(v).toLocaleString('ko-KR') }),
+        el('div', { class: 'hint', style: { marginTop: '8px' } },
+          '프롬프트·스킬 전략은 카탈로그·컨텍스트를 프롬프트에 길게 넣어 DB(검색) 전략보다 입력 토큰이 많은 경향이 있습니다. 토큰이 적을수록 비용·지연이 낮습니다.'));
+    }
+
+    return el('div', { class: 'grid cols-2', style: { marginBottom: '16px' } },
+      barCard, radarCard, latCard, diffCard, tokenCard);
   }
 
   /* ---------- 항목별 상세 ---------- */
@@ -633,11 +884,20 @@ export async function render(container, ctx) {
       el('div', { class: 'fld' }, el('label', {}, '질의'), el('div', { style: { color: 'var(--tx0)', lineHeight: 1.6 } }, it.query)),
       el('div', { class: 'row', style: { gap: '8px', marginBottom: '14px', flexWrap: 'wrap' } },
         it.difficulty ? badge(DIFF_LABEL[it.difficulty] || it.difficulty, DIFF_KIND[it.difficulty] || 'dim') : null,
+        it.metrics?.compositeScore != null ? badge(`품질점수 ${fmt.pct(it.metrics.compositeScore)}`, 'blue') : null,
         badge(`F1 ${fmt.pct(it.metrics?.f1)}`, 'blue'),
+        // 목표 특정 불가(null) → N/A 표시(빨강 '목표미달' 금지)
+        it.metrics?.goalAchieved == null
+          ? badge('목표 —', 'dim')
+          : badge(it.metrics.goalAchieved ? '목표달성 O' : '목표미달 X', it.metrics.goalAchieved ? 'green' : 'red'),
+        it.metrics?.callSuccessRate != null ? badge(`도구성공률 ${fmt.pct(it.metrics.callSuccessRate)}`, 'dim') : null,
         badge(`시퀀스 ${fmt.pct(it.metrics?.seqAccuracy)}`, 'dim'),
         it.metrics?.exactMatch ? badge('완전일치', 'green') : null,
         it.metrics?.paramScore != null ? badge(`파라미터 ${fmt.pct(it.metrics.paramScore)}`, 'dim') : null,
         it.metrics?.matchedAlternative != null ? badge(`대안 정답 #${it.metrics.matchedAlternative + 1}`, 'blue') : null,
+        (it.metrics?.inputTokens != null || it.metrics?.outputTokens != null)
+          ? badge(`토큰 ${it.metrics?.tokensEstimated ? '≈' : ''}입력 ${fmtTok(it.metrics?.inputTokens)} · 출력 ${fmtTok(it.metrics?.outputTokens)}`, 'violet')
+          : null,
         it.usedFallback ? badge('LLM 폴백', 'amber') : null,
         (it.hasStepErrors && !it.error) ? badge('부분 오류', 'amber') : null,
         badge(fmt.ms(it.latencyMs), 'dim'),
@@ -688,7 +948,10 @@ export async function render(container, ctx) {
   }
 
   function exportCSV(run) {
-    const header = ['전략', '타입', '항목ID', '질의', '기대워크플로우', '실제워크플로우', 'precision', 'recall', 'f1', 'seqAccuracy', 'exactMatch', 'paramScore', 'latencyMs', 'llmCalls', '오류'];
+    const header = ['전략', '타입', '항목ID', '질의', '기대워크플로우', '실제워크플로우',
+      'precision', 'recall', 'f1', 'seqAccuracy', 'exactMatch', 'paramScore',
+      'callSuccessRate', 'extraToolRate', 'goalAchieved', 'compositeScore',
+      'inputTokens', 'outputTokens', 'latencyMs', 'llmCalls', '오류'];
     const rows = [header];
     for (const id of run.strategyIds || []) {
       const ps = run.perStrategy?.[id];
@@ -701,6 +964,12 @@ export async function render(container, ctx) {
           wf(it.expected), wf(it.actual),
           num(m.precision), num(m.recall), num(m.f1), num(m.seqAccuracy),
           m.exactMatch ?? '', m.paramScore == null ? '' : num(m.paramScore),
+          m.callSuccessRate == null ? '' : num(m.callSuccessRate),
+          m.extraToolRate == null ? '' : num(m.extraToolRate),
+          m.goalAchieved == null ? '' : m.goalAchieved,
+          m.compositeScore == null ? '' : num(m.compositeScore),
+          m.inputTokens == null ? '' : Math.round(m.inputTokens),
+          m.outputTokens == null ? '' : Math.round(m.outputTokens),
           Math.round(it.latencyMs || 0), it.llmCalls || 0, it.error || '',
         ]);
       }
