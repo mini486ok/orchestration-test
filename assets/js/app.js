@@ -192,7 +192,7 @@ function renderShell() {
     el('div', { class: 'row' }, menuBtn, title),
     el('div', { class: 'topbar-right' },
       serverMode ? el('span', { class: 'badge green', title: '중앙 게이트웨이 서버 모드' }, '서버 모드') : null,
-      el('span', { class: 'badge dim mono', style: { fontFamily: 'var(--font-mono)' } }, 'v1.0')));
+      el('span', { class: 'badge dim mono', title: '빌드 2026-07-05 · MCP 100종·DB전략·실시간테스트·분야별 벤치마크', style: { fontFamily: 'var(--font-mono)' } }, 'v2.0')));
 
   const content = el('div', { class: 'content' });
   const main = el('main', { class: 'main' }, topbar, content);
