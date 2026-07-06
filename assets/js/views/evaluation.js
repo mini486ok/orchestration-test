@@ -32,6 +32,7 @@ const SORT_OPTS = [
   { key: 'avgExtraToolRate', label: '잉여호출률(오름차순)', asc: true },
   { key: 'avgPrecision', label: 'Precision', asc: false },
   { key: 'avgRecall', label: 'Recall', asc: false },
+  { key: 'avgRetrievalRecall', label: '검색 리콜', asc: false },
   { key: 'avgSeqAccuracy', label: '시퀀스', asc: false },
   { key: 'exactMatchRate', label: '완전일치', asc: false },
   { key: 'avgParamScore', label: '파라미터', asc: false },
@@ -134,15 +135,30 @@ const METRIC_INFO = {
     meaning: '부분 오류까지 포함한 실패 비율. react류는 단계 오류에서 회복할 수 있어 실행 실패율과 함께 봐야 합니다.',
     formula: '오류가 있었던 문항(단계 포함) / 전체 문항',
   },
+  retrievalRecall: {
+    name: '검색 리콜(retrievalRecall)', dir: 'up',
+    meaning: 'DB/검색 전략에서 정답 도구가 검색 후보에 포함된 비율입니다. 낮으면 검색 단계 실패(정답 도구가 후보에서 누락), 검색 리콜은 높은데 F1이 낮으면 플래너 실패로 구분해 해석합니다. 전체 카탈로그를 주입하는 전략은 검색 단계가 없어 N/A(-)입니다.',
+    formula: '검색 후보에 포함된 정답 도구 수 / 정답 도구 수 — 검색 기록(retrievedTools)이 있는 문항만 평균, 전체 주입·기록 없음은 제외 · 다중정답 후보(primary·alternatives) 중 최대 커버리지(채택 정답과 다를 수 있음 — 완전한 정답 경로가 후보에 존재했는지의 기회 상한)',
+  },
+  goalRetrieved: {
+    name: '목표 도구 검색 여부(goalRetrieved)', dir: 'up',
+    meaning: '검색 기록(retrievedTools)이 있는 문항에서 목표(최종) 도구가 검색 후보에 포함됐는지입니다. false면 검색 단계에서 목표 도구가 통째로 누락된 것으로, 플래너가 아무리 잘해도 목표 달성이 불가능합니다 — 검색 리콜과 함께 검색 실패/플래너 실패를 구분하는 데 사용합니다. 검색 기록이 없는 문항은 N/A(null)입니다.',
+    formula: '목표 후보(item.goal 또는 각 정답 경로의 마지막 단계) 중 하나라도 검색 후보에 포함되면 true · 기록 없으면 null — 리더보드 검색 리콜 title에 미검색(goalRetrieved=false) 문항 수 병기',
+  },
   ctxOverflowCount: {
     name: '컨텍스트 초과 문항 수(⚠ctx)', dir: 'down',
-    meaning: '프롬프트가 numCtx를 넘어 잘렸을 가능성이 있는 문항 수입니다. 카탈로그·컨텍스트가 잘린 채 실행되므로 해당 전략의 점수는 신뢰할 수 없습니다. numCtx 상향 또는 DB(검색) 전략 사용을 권장합니다.',
+    meaning: '프롬프트가 numCtx를 넘어 잘렸을 가능성이 있는 문항 수입니다. 카탈로그·컨텍스트가 잘린 채 실행되므로 해당 전략의 점수는 신뢰할 수 없습니다. numCtx 상향 또는 DB(검색) 전략 사용을 권장합니다. numCtx가 다른 run 간에는 이 수치를 비교할 수 없습니다.',
     formula: 'ctxOverflow=true 문항 수 (프롬프트 전체 추정(chars/2.2) > numCtx 또는 실측 promptTokens ≥ numCtx×0.98)',
   },
   retrievalFallbackCount: {
     name: '검색 폴백 문항 수(⚠폴백)', dir: 'down',
-    meaning: 'DB 전략이 의도한 검색이 아닌 폴백으로 실행된 문항 수입니다(예: graph→vector, vector→keyword, 검색 0건→전체 카탈로그). 전략 설계 의도와 다른 조건에서 측정된 점수임을 뜻합니다.',
+    meaning: 'DB 전략이 의도한 검색이 아닌 폴백으로 실행된 문항 수입니다(예: graph→vector, vector→keyword, 검색 0건→전체 카탈로그). 전략 설계 의도와 다른 조건에서 측정된 점수임을 뜻합니다. numCtx가 다른 run 간에는 이 수치를 비교할 수 없습니다.',
     formula: 'retrievalFallback ≠ null 문항 수',
+  },
+  catalogCompressedCount: {
+    name: '카탈로그 축약 문항 수(축약 L{max}×N)', dir: 'down',
+    meaning: '컨텍스트 예산에 맞춰 도구 카탈로그가 자동 축약된 채 실행된 문항 수입니다. 서버·도구는 전부 유지되고 파라미터·설명 상세도만 단계적으로(L1~L4) 낮아집니다 — ⚠와 달리 오류가 아닌 조건 표시입니다. 적용 레벨은 문항 상세의 "축약 L{n}" 뱃지·트레이스에서 확인하며, numCtx를 높이면 상세도가 올라갑니다. numCtx가 다른 run 간에는 이 수치를 비교할 수 없습니다.',
+    formula: 'catalogDetail > 0 문항 수 (L{max}=해당 전략 문항들의 최대 축약 레벨)',
   },
 };
 
@@ -390,7 +406,7 @@ export async function render(container, ctx) {
     /* ---------- 사전 점검(preflight) — 비차단 amber 경고, 실패는 조용히 무시 ---------- */
     const preflightBox = el('div', {});
 
-    /** 전체 카탈로그를 프롬프트에 주입하는 전략인지 (프롬프트 full/스킬/룰 LLM 폴백) */
+    /** [폴백] 전체 카탈로그를 프롬프트에 주입하는 전략인지 — 구버전 orchestrator(usesFullCatalog 부재)용 근사 분류 */
     function isFullCatalogStrategy(s) {
       if (!s) return false;
       if (s.type === 'prompt') return s.config?.catalogMode !== 'retrieval';
@@ -399,17 +415,81 @@ export async function render(container, ctx) {
       return false; // db는 검색으로 축소 카탈로그 구성
     }
 
+    /** 전체 카탈로그 주입 전략 판정 — orchestrator.usesFullCatalog(유효 프롬프트 템플릿의
+     *  {{TOOL_CATALOG}} 포함 여부까지 판정 — skill/rule 허위 경고 제거) 우선, 부재 시 기존 분류 폴백 */
+    function isFullCatalog(s) {
+      if (typeof orchestratorMod.usesFullCatalog === 'function') {
+        try { return !!orchestratorMod.usesFullCatalog(s); } catch { /* 판정 실패 시 폴백 */ }
+      }
+      return isFullCatalogStrategy(s);
+    }
+
     /** 선택된 세트·전략 기준 경고 문자열 배열 계산 — LLM 호출 없음, 각 점검은 개별 try/catch */
     function computePreflight(set, chosen) {
       const warns = [];
-      // (1) 전체 카탈로그 주입 전략: 카탈로그 추정 토큰 vs numCtx
+      // (1) 전체 카탈로그 주입 전략: 카탈로그 추정 토큰 vs 컨텍스트 예산 — 전략별 카탈로그 구성(fields)·자동 축약(autoFit) 반영(r6)
       try {
-        const fullCat = chosen.filter(isFullCatalogStrategy);
+        const fullCat = chosen.filter(isFullCatalog);
         if (fullCat.length && typeof orchestratorMod.estimateCatalogTokens === 'function') {
-          const est = orchestratorMod.estimateCatalogTokens(mcps);
           const numCtx = getNumCtx();
-          if (Number.isFinite(est) && Number.isFinite(numCtx) && est > numCtx) {
-            warns.push(`카탈로그 ≈${Math.round(est).toLocaleString('ko-KR')} tokens > numCtx ${numCtx.toLocaleString('ko-KR')} — 프롬프트가 잘려 결과가 오염될 수 있습니다. 설정에서 numCtx 상향 또는 DB(검색) 전략을 권장합니다. (해당 전략: ${fullCat.map((s) => s.name).join(', ')})`);
+          // 신버전 orchestrator(자동 축약 지원) 여부 — 부재 시 기존 절단 경고 문구로 폴백
+          const hasFitted = typeof orchestratorMod.catalogBudgetTokens === 'function'
+            && typeof orchestratorMod.buildToolCatalogFitted === 'function';
+          if (Number.isFinite(numCtx)) {
+            if (hasFitted) {
+              // 예산은 planningMode별·유효 maxSteps별(react 차감이 maxSteps 비례)·추정 토큰은 카탈로그 구성(fields)별로
+              // 다름 — (모드·유효 maxSteps·구성·autoFit)이 같은 전략끼리 묶어 안내(r8 §H4-1).
+              // config.catalog는 프롬프트(full) 전략의 r6 설정 — 부재 시(스킬·룰 폴백 포함) 기본 구성으로 간주.
+              const DEF_FIELDS = { desc: true, params: true, outputs: false, examples: false };
+              const uni = maxStepsVal(); // maxSteps 통일값 우선 — 전략 cfg.maxSteps 폴백(둘 다 없으면 6)
+              const groups = new Map();
+              for (const s of fullCat) {
+                const cat = s.config?.catalog || {};
+                const fields = { ...DEF_FIELDS, ...(cat.fields || {}) };
+                const autoFit = cat.autoFit !== false;
+                const mode = s.config?.planningMode === 'react' ? 'react' : 'plan';
+                const cfgSteps = Math.floor(Number(s.config?.maxSteps));
+                const effSteps = Math.min(uni != null ? uni : (Number.isFinite(cfgSteps) && cfgSteps > 0 ? cfgSteps : 6), 20);
+                const key = [mode, effSteps, autoFit, ...Object.keys(DEF_FIELDS).map((k) => (fields[k] ? 1 : 0))].join('|');
+                if (!groups.has(key)) groups.set(key, { mode, effSteps, autoFit, fields, list: [] });
+                groups.get(key).list.push(s);
+              }
+              for (const { mode, effSteps, autoFit, fields, list } of groups.values()) {
+                const est = orchestratorMod.estimateCatalogTokens(mcps, fields);
+                // 3인자 호출 — react 예산이 유효 maxSteps에 비례해 차감됨(구버전 orchestrator는 3번째 인자 무시).
+                const budget = orchestratorMod.catalogBudgetTokens(numCtx, mode, effSteps);
+                if (!Number.isFinite(est) || !Number.isFinite(budget) || est <= budget) continue;
+                const head = `카탈로그 ≈${Math.round(est).toLocaleString('ko-KR')} tok > 예산 ≈${Math.round(budget).toLocaleString('ko-KR')} tok`;
+                const names = list.map((s) => s.name).join(', ');
+                if (autoFit) {
+                  const level = orchestratorMod.buildToolCatalogFitted(mcps, budget, fields).level;
+                  warns.push(`${head} — 자동 축약(예상 레벨 L${level})으로 전체 서버는 유지되지만 파라미터·설명 상세도가 낮아집니다. numCtx를 높이면 상세도가 올라갑니다. (해당 전략: ${names})`);
+                } else {
+                  warns.push(`⚠ ${head} — 자동 축약(autoFit)이 꺼져 있어 프롬프트가 잘려 결과가 오염될 수 있습니다. 자동 축약을 켜거나 numCtx 상향·카탈로그 구성 축소를 권장합니다. (해당 전략: ${names})`);
+                }
+              }
+            } else {
+              const est = orchestratorMod.estimateCatalogTokens(mcps);
+              if (Number.isFinite(est) && est > numCtx) {
+                warns.push(`카탈로그 ≈${Math.round(est).toLocaleString('ko-KR')} tokens > numCtx ${numCtx.toLocaleString('ko-KR')} — 프롬프트가 잘려 결과가 오염될 수 있습니다. 설정에서 numCtx 상향 또는 DB(검색) 전략을 권장합니다. (해당 전략: ${fullCat.map((s) => s.name).join(', ')})`);
+              }
+            }
+          }
+        }
+      } catch { /* 조용히 무시 */ }
+      // (1.5) 커스텀 플래너 템플릿에 {{TOOL_CATALOG}} 미포함(r8 §H4-2) — 도구 목록이 주입되지 않아
+      // 직접 나열한 경우가 아니면 계획이 실패함. orchestrator 의존 없이 evaluation.js 자체 판정:
+      // prompt(full)의 systemPrompt / rule(llmFallback)의 fallbackPrompt가 비어있지 않은 문자열인데 플레이스홀더 미포함.
+      try {
+        for (const s of chosen) {
+          const cfg = s.config || {};
+          let tpl = null;
+          if (s.type === 'prompt' && cfg.catalogMode !== 'retrieval') tpl = cfg.systemPrompt;
+          else if (s.type === 'rule' && cfg.onNoMatch === 'llmFallback') tpl = cfg.fallbackPrompt;
+          // rule은 런타임(runRule)과 동일하게 공백뿐인 템플릿을 기본 템플릿으로 간주 — trim 기준으로 판정
+          const custom = typeof tpl === 'string' && (s.type === 'rule' ? tpl.trim() !== '' : tpl !== '');
+          if (custom && !tpl.includes('{{TOOL_CATALOG}}')) {
+            warns.push(`'${s.name}': ⚠ 플래너 프롬프트에 {{TOOL_CATALOG}}가 없어 도구 목록이 주입되지 않습니다(직접 나열한 경우가 아니라면 계획이 실패합니다)`);
           }
         }
       } catch { /* 조용히 무시 */ }
@@ -684,7 +764,7 @@ export async function render(container, ctx) {
             el('h2', { style: { fontSize: '18px', color: 'var(--tx0)' } }, run.name || run.benchmarkSetName),
             badge(STATUS_LABEL[run.status] || run.status, STATUS_KIND[run.status] || 'dim')),
           el('div', { class: 'hint', style: { marginTop: '4px' } },
-            `${run.benchmarkSetName || '-'} · ${fmt.date(run.createdAt)} · 전략 ${baseStrat.length}개${run.model ? ' · 모델 ' + run.model : ''}${run.temperature != null ? ' · 온도 통일 ' + run.temperature : ''}${run.maxSteps != null ? ' · maxSteps 통일 ' + run.maxSteps : ''}`)),
+            `${run.benchmarkSetName || '-'} · ${fmt.date(run.createdAt)} · 전략 ${baseStrat.length}개${run.model ? ' · 모델 ' + run.model : ''}${run.temperature != null ? ' · 온도 통일 ' + run.temperature : ''}${run.maxSteps != null ? ' · maxSteps 통일 ' + run.maxSteps : ''}${Number.isFinite(run.numCtx) ? ' · numCtx ' + Math.round(run.numCtx).toLocaleString('ko-KR') : ''}`)),
         el('div', { class: 'row wrap', style: { gap: '8px' } },
           el('button', { class: 'btn btn-sm', onclick: () => exportJSON(run) }, '⬇ JSON'),
           el('button', { class: 'btn btn-sm', onclick: () => exportCSV(run) }, '⬇ CSV'),
@@ -742,6 +822,24 @@ export async function render(container, ctx) {
       el('div', { class: 'gl-section-title' }, title),
       el('div', { class: 'gl-grid' }, keys.map(item)));
 
+    // 카탈로그 축약 레벨표(L1~L4) — 리더보드 '축약 L{max}×N' 뱃지·문항 상세 '축약 L{n}' 뱃지의 레벨 의미
+    const LEVEL_ROWS = [
+      ['L1', '예시값 (examples) 제외 · 설명 절단'],
+      ['L2', '+ 출력·선택 파라미터 제외 · 서버 설명 제거'],
+      ['L3', '필수 파라미터 이름만'],
+      ['L4', '서버·도구명만'],
+    ];
+    const levelTable = el('div', {},
+      el('div', { class: 'gl-section-title' }, '카탈로그 축약 레벨 (L1~L4)'),
+      el('div', { class: 'tbl-wrap' },
+        el('table', { class: 'tbl' },
+          el('thead', {}, el('tr', {}, el('th', {}, '레벨'), el('th', {}, '축약 내용 (누적 적용)'))),
+          el('tbody', {}, LEVEL_ROWS.map(([lv, desc]) => el('tr', {},
+            el('td', { class: 'mono', style: { whiteSpace: 'nowrap' } }, lv),
+            el('td', {}, desc)))))),
+      el('div', { class: 'hint', style: { marginTop: '6px' } },
+        '레벨이 높을수록 상세도가 낮습니다. 적용 레벨은 문항 상세의 \'축약 L{n}\' 뱃지·트레이스에서 확인하며, numCtx를 높이면 상세도가 올라갑니다.'));
+
     const hero = el('div', { class: 'gl-hero' },
       el('div', { class: 'gl-hero-title' }, '오케스트레이션 종합점수 공식'),
       el('div', { class: 'gl-hero-formula' },
@@ -762,7 +860,9 @@ export async function render(container, ctx) {
           section('파라미터 · 목표 달성', ['paramScore', 'goalAchieved', 'callSuccessRate', 'extraToolRate']),
           section('토큰 사용량', ['inputTokens', 'outputTokens', 'totalTokens']),
           section('실행 비용 · 안정성', ['avgLatencyMs', 'avgLlmCalls', 'errorRate']),
-          section('결과 신뢰도 (리더보드 ⚠ 뱃지)', ['ctxOverflowCount', 'retrievalFallbackCount']))));
+          section('검색 품질 (DB/검색 전략)', ['retrievalRecall', 'goalRetrieved']),
+          section('결과 신뢰도 (리더보드 뱃지)', ['ctxOverflowCount', 'retrievalFallbackCount', 'catalogCompressedCount']),
+          levelTable)));
   }
 
   /* ---------- 인사이트 한 줄 ---------- */
@@ -809,6 +909,9 @@ export async function render(container, ctx) {
 
   /* ---------- 리더보드 ---------- */
   function buildLeaderboard(strat, sortKey = 'orchestrationScore', onSortChange) {
+    // r8(§H4-3): 모든 전략이 검색 리콜 없음(전체 주입만·구버전 run)이면 '검색 리콜' 열 자체를 생략.
+    // th/td 쌍 정합: 이 플래그 하나로 헤더·행 모두 분기한다.
+    const showRetrievalCol = strat.some((s) => s.summary?.avgRetrievalRecall != null);
     const metricBar = (v, fill) => el('div', { class: 'metric-bar' },
       el('div', { class: 'mb-track' }, el('div', { class: 'mb-fill', style: { width: Math.max(0, Math.min(1, v || 0)) * 100 + '%', ...(fill ? { background: fill } : {}) } })),
       el('span', { class: 'mb-val' }, fmt.pct(v)));
@@ -827,9 +930,10 @@ export async function render(container, ctx) {
     const rows = strat.map((s, i) => {
       const m = s.summary;
       const isRuleFallback = s.strategyType === 'rule' && (m.fallbackRate || 0) > 0;
-      // 신뢰도 뱃지 — 신규 요약 키(ctxOverflowCount/retrievalFallbackCount)가 없는 구버전 run은 뱃지 없음
+      // 신뢰도 뱃지 — 신규 요약 키(ctxOverflowCount/retrievalFallbackCount/catalogCompressedCount)가 없는 구버전 run은 뱃지 없음
       const ctxN = Number(m.ctxOverflowCount) || 0;
       const rfN = Number(m.retrievalFallbackCount) || 0;
+      const compN = Number(m.catalogCompressedCount) || 0;
       const nameCell = el('td', {},
         el('div', { class: 'row', style: { gap: '7px', flexWrap: 'wrap', alignItems: 'center' } },
           el('b', { style: { color: 'var(--tx0)' } }, s.strategyName),
@@ -842,6 +946,17 @@ export async function render(container, ctx) {
             : null,
           rfN > 0
             ? el('span', { class: 'badge amber', title: `검색 폴백 ${rfN}문항 — DB 전략이 의도한 검색(vector/graph)이 아닌 폴백 경로로 실행되었습니다. 전략 설계 의도와 다른 조건에서 측정된 점수입니다.` }, `⚠폴백 ${rfN}`)
+            : null,
+          // 카탈로그 자동 축약 — 오류가 아닌 조건 표시라 ⚠(amber)와 구분되는 dim 톤.
+          // catalogDetailMax(0~4)가 있으면 '축약 L{max}×N' 형식, 부재(구버전 run)면 기존 '축약 N' 폴백.
+          compN > 0
+            ? (() => {
+                const lvlMax = Number(m.catalogDetailMax) || 0;
+                return el('span', {
+                  class: 'badge dim',
+                  title: `카탈로그 자동 축약이 적용된 문항 수 — 전체 서버 유지, 상세도 하향${lvlMax > 0 ? ` (최대 레벨 L${lvlMax})` : ''}. 문항 상세의 '축약 L{n}' 뱃지·트레이스 참조`,
+                }, lvlMax > 0 ? `축약 L${lvlMax}×${compN}` : `축약 ${compN}`);
+              })()
             : null),
         (isRuleFallback && m.avgF1Matched != null)
           ? el('div', { class: 'hint', style: { marginTop: '3px', color: 'var(--tx2)' } }, `룰 매치 항목만 F1 ${fmt.pct(m.avgF1Matched)}`)
@@ -859,6 +974,21 @@ export async function render(container, ctx) {
         }, fmt.pct(m.avgExtraToolRate)),
         el('td', { class: 'num' }, fmt.pct(m.avgPrecision)),
         el('td', { class: 'num' }, fmt.pct(m.avgRecall)),
+        // 검색 리콜 — 전체 카탈로그 주입 전략·구버전 run(avgRetrievalRecall 없음)은 '-'(N/A).
+        // 모든 전략이 N/A면 열 자체를 생략(showRetrievalCol — 헤더와 쌍 정합).
+        !showRetrievalCol ? null : (() => {
+          const rr = m.avgRetrievalRecall;
+          const missN = Number(m.retrievalMissCount) || 0;
+          const goalMissN = Number(m.goalMissCount) || 0; // r8: goalRetrieved=false 문항 수(구버전 run은 0)
+          const titleParts = [];
+          if (rr != null && missN > 0) titleParts.push(`검색 미스 ${missN}문항 — 정답 도구가 검색 후보에서 일부 누락된(리콜<1) 문항 수`);
+          if (rr != null && goalMissN > 0) titleParts.push(`목표 도구 미검색 ${goalMissN}문항 — 목표(최종) 도구가 검색 후보에 아예 없어 목표 달성이 불가능했던 문항 수`);
+          return el('td', {
+            class: 'num',
+            style: rr == null ? { color: 'var(--tx3)' } : ((missN > 0 || goalMissN > 0) ? { color: 'var(--sig-amber)' } : {}),
+            title: titleParts.join('\n'),
+          }, fmtRate(rr));
+        })(),
         el('td', { class: 'num' }, fmt.pct(m.avgSeqAccuracy)),
         el('td', { class: 'num' }, fmt.pct(m.exactMatchRate)),
         el('td', { class: 'num' }, m.avgParamScore == null ? '-' : fmt.pct(m.avgParamScore)),
@@ -887,6 +1017,7 @@ export async function render(container, ctx) {
             thHelp('목표달성', 'goalAchieved'), thHelp('도구성공', 'callSuccessRate'),
             thHelp('잉여호출', 'extraToolRate'),
             thHelp('Precision', 'precision'), thHelp('Recall', 'recall'),
+            showRetrievalCol ? thHelp('검색 리콜', 'retrievalRecall') : null,
             thHelp('시퀀스', 'seqAccuracy'), thHelp('완전일치', 'exactMatch'),
             thHelp('파라미터', 'paramScore'), thHelp('평균토큰', 'totalTokens'),
             thHelp('평균 지연', 'avgLatencyMs'), thHelp('LLM', 'avgLlmCalls'),
@@ -1085,11 +1216,48 @@ export async function render(container, ctx) {
     return el('div', { class: 'card' },
       el('div', { class: 'row between', style: { marginBottom: '12px', flexWrap: 'wrap', gap: '8px' } },
         el('div', { class: 'panel-title', style: { margin: 0 } }, '항목별 상세', el('span', { class: 'sub' }, '행 클릭 시 실행 로그')),
-        strat.length > 1 ? segmented(strat.map((s) => ({ label: s.strategyName, value: s.id })), selId, (v) => { selId = v; renderTable(); }) : null),
+        el('div', { class: 'row', style: { gap: '8px', flexWrap: 'wrap', alignItems: 'center' } },
+          strat.length > 1 ? segmented(strat.map((s) => ({ label: s.strategyName, value: s.id })), selId, (v) => { selId = v; renderTable(); }) : null,
+          // r8(§H4-6): 실행 시점 구성 스냅샷(run.numCtx/toolCount + 전략별 configSnapshot) 모달
+          el('button', {
+            class: 'btn btn-sm',
+            title: '이 실행에 기록된 실행 환경(numCtx·전체 도구 수)과 전략별 구성 스냅샷을 확인합니다.',
+            onclick: () => openConfigModal(run, strat),
+          }, '⚙ 구성'))),
       filterBar,
       el('div', { class: 'hint', style: { marginBottom: '10px' } },
         '워크플로우 표식: ', el('span', { style: { color: 'var(--sig-red)' } }, '● 누락'), ' · ', el('span', { style: { color: 'var(--sig-amber)' } }, '● 초과')),
       tableBox);
+  }
+
+  /* ---------- 구성 스냅샷 모달 (r8 §H4-6) ---------- */
+  // run.numCtx/toolCount + perStrategy.configSnapshot을 pretty JSON으로 노출.
+  // 구버전 run(스냅샷·toolCount 미기록)은 크래시 없이 "기록 없음/스냅샷 없음" 안내.
+  function openConfigModal(run, strat) {
+    const preStyle = {
+      fontFamily: 'var(--font-mono)', fontSize: '11.5px', lineHeight: '1.55', color: 'var(--tx1)',
+      background: 'var(--bg2)', border: '1px solid var(--line-soft)', borderRadius: '6px',
+      padding: '10px 12px', margin: 0, overflow: 'auto', maxHeight: '300px',
+    };
+    const runInfo = [
+      `numCtx ${Number.isFinite(run.numCtx) ? Math.round(run.numCtx).toLocaleString('ko-KR') : '- (기록 없음)'}`,
+      `전체 도구 ${Number.isFinite(run.toolCount) ? Math.round(run.toolCount).toLocaleString('ko-KR') + '개' : '- (기록 없음)'}`,
+    ];
+    if (run.model) runInfo.push(`모델 오버라이드 ${run.model}`);
+    if (run.temperature != null) runInfo.push(`온도 통일 ${run.temperature}`);
+    if (run.maxSteps != null) runInfo.push(`maxSteps 통일 ${run.maxSteps}`);
+    const body = el('div', {},
+      el('div', { class: 'fld' },
+        el('label', {}, '실행 공통'),
+        el('div', { style: { color: 'var(--tx1)', fontSize: '12.5px', lineHeight: 1.6 } }, runInfo.join(' · '))),
+      ...strat.map((s) => el('div', { class: 'fld' },
+        el('label', {}, `${s.strategyName} `, typeBadge(s.strategyType)),
+        s.configSnapshot
+          ? el('pre', { style: preStyle }, JSON.stringify(s.configSnapshot, null, 2))
+          : el('div', { class: 'hint', style: { color: 'var(--tx3)' } }, '스냅샷 없음 — 이 실행(구버전)에는 전략 구성 스냅샷이 기록되지 않았습니다.'))),
+      el('div', { class: 'hint', style: { marginTop: '4px' } },
+        '실행 시점에 기록된 값입니다 — 이후 전략을 수정해도 이 스냅샷은 바뀌지 않아 결과 재현·비교에 사용할 수 있습니다.'));
+    modal({ title: '⚙ 실행 구성 스냅샷', body, wide: true, actions: [{ label: '닫기', class: 'btn-ghost' }] });
   }
 
   /* ---------- 항목 상세 모달 ---------- */
@@ -1110,6 +1278,13 @@ export async function render(container, ctx) {
         it.metrics?.exactMatch ? badge('완전일치', 'green') : null,
         it.metrics?.paramScore != null ? badge(`파라미터 ${fmt.pct(it.metrics.paramScore)}`, 'dim') : null,
         it.metrics?.matchedAlternative != null ? badge(`대안 정답 #${it.metrics.matchedAlternative + 1}`, 'blue') : null,
+        // r8(§H4-4): 검색 리콜(retrievedTools 기록 문항만) + 목표 도구 미검색(goalRetrieved=false) 뱃지 — 구버전 run(키 부재)은 미표시
+        it.metrics?.retrievalRecall != null
+          ? el('span', { class: 'badge dim', title: '이 문항에서 정답 도구가 검색 후보(retrievedTools)에 포함된 비율 — 다중정답 후보 중 최대 커버리지' }, `검색리콜 ${fmt.pct(it.metrics.retrievalRecall)}`)
+          : null,
+        it.metrics?.goalRetrieved === false
+          ? el('span', { class: 'badge amber', title: '목표(최종) 도구가 검색 후보(retrievedTools)에 포함되지 않았습니다 — 검색 단계 실패로, 플래너가 아무리 잘해도 목표 달성이 불가능한 문항입니다.' }, '목표도구 미검색')
+          : null,
         (it.metrics?.inputTokens != null || it.metrics?.outputTokens != null)
           ? badge(`토큰 ${it.metrics?.tokensEstimated ? '≈' : ''}입력 ${fmtTok(it.metrics?.inputTokens)} · 출력 ${fmtTok(it.metrics?.outputTokens)}`, 'violet')
           : null,
@@ -1121,6 +1296,10 @@ export async function render(container, ctx) {
           : null,
         it.metrics?.retrievalFallback
           ? el('span', { class: 'badge amber', title: String(it.metrics.retrievalFallback) }, '⚠폴백')
+          : null,
+        // 카탈로그 자동 축약 레벨 — 오류가 아닌 조건 표시(dim). 구버전 run(catalogDetail 없음)은 뱃지 없음
+        (Number(it.metrics?.catalogDetail) || 0) > 0
+          ? el('span', { class: 'badge dim', title: `카탈로그 자동 축약 레벨 L${it.metrics.catalogDetail} — 컨텍스트 예산에 맞춰 서버·도구는 전부 유지한 채 파라미터·설명 상세도만 낮춰 주입했습니다(오류 아님). numCtx를 높이면 상세도가 올라갑니다.` }, `축약 L${it.metrics.catalogDetail}`)
           : null,
         badge(fmt.ms(it.latencyMs), 'dim'),
         badge(`LLM ${it.llmCalls || 0}`, 'violet')),
@@ -1173,7 +1352,9 @@ export async function render(container, ctx) {
     const header = ['전략', '타입', '항목ID', '질의', '기대워크플로우', '실제워크플로우',
       'precision', 'recall', 'f1', 'seqAccuracy', 'exactMatch', 'paramScore',
       'callSuccessRate', 'extraToolRate', 'goalAchieved', 'compositeScore',
-      'inputTokens', 'outputTokens', 'latencyMs', 'llmCalls', '오류'];
+      'inputTokens', 'outputTokens', 'latencyMs', 'llmCalls', '오류',
+      // r7 신규(맨 뒤 추가 — 기존 열 위치 보존): 신뢰도 플래그 + 검색 리콜. 구버전 run은 빈 값.
+      'ctxOverflow', 'retrievalFallback', 'catalogDetail', 'retrievalRecall'];
     const rows = [header];
     for (const id of run.strategyIds || []) {
       const ps = run.perStrategy?.[id];
@@ -1193,6 +1374,10 @@ export async function render(container, ctx) {
           m.inputTokens == null ? '' : Math.round(m.inputTokens),
           m.outputTokens == null ? '' : Math.round(m.outputTokens),
           Math.round(it.latencyMs || 0), it.llmCalls || 0, it.error || '',
+          m.ctxOverflow == null ? '' : m.ctxOverflow,
+          m.retrievalFallback == null ? '' : String(m.retrievalFallback),
+          m.catalogDetail == null ? '' : m.catalogDetail,
+          m.retrievalRecall == null ? '' : num(m.retrievalRecall),
         ]);
       }
     }

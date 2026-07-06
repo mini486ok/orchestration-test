@@ -4,6 +4,8 @@
 import { chatJSON, getDefaultModel, getNumCtx } from './ollama.js';
 import { executeTool, validateParams } from './mockEngine.js';
 import { retrieve } from './catalogIndex.js';
+// r7: retrieveMulti는 catalogIndex(F2)가 병렬 구현 — 부재 시 multiQuery를 조용히 무시하기 위해 네임스페이스로도 참조.
+import * as catalogIndexApi from './catalogIndex.js';
 import { store } from '../core/store.js';
 import { graphRetrieve, graphStatus, recommendPaths, GRAPH_KEY } from './catalogGraph.js';
 
@@ -61,27 +63,104 @@ export const DEFAULT_SKILL_SELECTOR_PROMPT =
    도구 카탈로그
    ============================================================ */
 
-function describeParam(name, prop = {}, required = false) {
+function describeParam(name, prop = {}, required = false, withExamples = false) {
   let t = prop.type || 'any';
   if (prop.type === 'array') t = `array<${prop.items?.type || 'any'}>`;
   let s = `${name}:${t}`;
   if (required) s += '*';
   if (Array.isArray(prop.enum) && prop.enum.length) s += `(${prop.enum.map(String).join('|')})`;
+  // r6: examples 필드가 켜진 경우(L0 전용) 첫 예시값을 '=예:값'으로 덧붙임(30자 절단)
+  // r7: 예시값이 객체/배열이면 '[object Object]' 대신 JSON 직렬화 후 절단
+  if (withExamples && Array.isArray(prop.examples) && prop.examples.length && prop.examples[0] != null) {
+    const ex = prop.examples[0];
+    let exStr;
+    if (typeof ex === 'object') { try { exStr = JSON.stringify(ex); } catch { exStr = String(ex); } }
+    else exStr = String(ex);
+    s += `=예:${clip(exStr, 30)}`;
+  }
   return s;
 }
 
-/** LLM 프롬프트용 도구 카탈로그 텍스트 (토큰 절약형) */
-export function buildToolCatalog(mcps = []) {
-  const lines = ['(표기: 도구명(파라미터명:타입) · *=필수 · (a|b)=허용값)'];
+/**
+ * 카탈로그 구성 요소 기본값(r6) — desc: 서버·도구 설명 / params: 입력 파라미터(타입·필수·enum) /
+ * outputs: 도구별 출력 스키마 키 / examples: 파라미터 예시값.
+ * 기본값으로 호출하면 buildToolCatalog 계열의 출력은 이전(r5)과 완전 동일하다(회귀 0).
+ */
+export const DEFAULT_CATALOG_FIELDS = Object.freeze({ desc: true, params: true, outputs: false, examples: false });
+
+/** fields 부분 지정을 기본값으로 back-fill(순수 함수 — 인자 원본은 변경하지 않음) */
+function normalizeCatalogFields(fields) {
+  return { ...DEFAULT_CATALOG_FIELDS, ...(fields || {}) };
+}
+
+/**
+ * outputs 표기용 키 목록 — outputSchema 최상위 properties 키 + array 항목의 1단계 properties 키('부모[].자식'),
+ * 최대 10개 초과분은 '…'로 축약. 스키마가 없거나 키가 없으면 빈 문자열(표기 생략).
+ */
+function outputKeys(tool) {
+  const props = tool?.outputSchema?.properties;
+  if (!props || typeof props !== 'object') return '';
+  const keys = [];
+  for (const [k, v] of Object.entries(props)) {
+    keys.push(k);
+    const itemProps = v?.type === 'array' ? v?.items?.properties : null;
+    if (itemProps && typeof itemProps === 'object') {
+      for (const ik of Object.keys(itemProps)) keys.push(`${k}[].${ik}`);
+    }
+  }
+  if (!keys.length) return '';
+  return keys.slice(0, 10).join(', ') + (keys.length > 10 ? ', …' : '');
+}
+
+/**
+ * 카탈로그 상단 표기 안내줄 — 켜진 fields와 레벨별 파라미터 표기 규칙에 맞춰 구성.
+ * 기본 fields일 때 L0~L3 각각 기존(r5) 문구와 완전 동일한 줄을 생성한다.
+ */
+function catalogHeader(f, level = 0) {
+  const parts = [];
+  if (f.params) {
+    if (level <= 1) {
+      parts.push('도구명(파라미터명:타입)', '*=필수', '(a|b)=허용값');
+      if (level === 0 && f.examples) parts.push('=예:값=예시값');
+    } else if (level === 2) {
+      parts.push('도구명(필수 파라미터:타입)', '(a|b)=허용값', '-=필수 파라미터 없음');
+    } else {
+      parts.push('도구명(필수 파라미터명)', '-=필수 파라미터 없음');
+    }
+  } else {
+    parts.push('도구명');
+  }
+  if (f.outputs && level <= 1) parts.push('→ 출력:=출력 스키마 키');
+  return `(표기: ${parts.join(' · ')})`;
+}
+
+/**
+ * LLM 프롬프트용 도구 카탈로그 텍스트 (토큰 절약형)
+ * @param {Array} mcps MCP 서버 배열
+ * @param {{desc?:boolean, params?:boolean, outputs?:boolean, examples?:boolean}} [fields]
+ *        포함 요소 선택(부분 지정 가능) — 미지정 시 DEFAULT_CATALOG_FIELDS(기존 출력과 완전 동일)
+ */
+export function buildToolCatalog(mcps = [], fields) {
+  const f = normalizeCatalogFields(fields);
+  const lines = [catalogHeader(f, 0)];
   for (const server of mcps || []) {
     if (!server || !server.tools || !server.tools.length) continue;
     const head = `[${server.id}] ${server.nameKo || server.name || ''}`;
-    lines.push(server.description ? `${head} — ${server.description}` : head);
+    lines.push(f.desc && server.description ? `${head} — ${server.description}` : head);
     for (const tool of server.tools) {
-      const props = tool.inputSchema?.properties || {};
-      const req = new Set(tool.inputSchema?.required || []);
-      const params = Object.entries(props).map(([n, p]) => describeParam(n, p, req.has(n))).join(', ');
-      lines.push(`  - ${tool.name}(${params || '파라미터 없음'}): ${tool.description || ''}`);
+      let line = `  - ${tool.name}`;
+      if (f.params) {
+        const props = tool.inputSchema?.properties || {};
+        const req = new Set(tool.inputSchema?.required || []);
+        const params = Object.entries(props).map(([n, p]) => describeParam(n, p, req.has(n), f.examples)).join(', ');
+        line += `(${params || '파라미터 없음'})`;
+      }
+      if (f.desc) line += `: ${tool.description || ''}`;
+      if (f.outputs) {
+        const outs = outputKeys(tool);
+        if (outs) line += ` → 출력: ${outs}`;
+      }
+      lines.push(line);
     }
   }
   return lines.length > 1 ? lines.join('\n') : '(등록된 도구가 없습니다)';
@@ -91,15 +170,191 @@ export function buildToolCatalog(mcps = []) {
  * 전체 카탈로그 프롬프트 텍스트의 추정 토큰 수 — buildToolCatalog 재사용, LLM 호출 없음(순수 함수).
  * 한글 혼합 텍스트 기준 chars/2.2 근사(llmJSON의 컨텍스트 예산 추정과 동일 기준). 평가 preflight용.
  * @param {Array} mcps MCP 서버 배열
+ * @param {object} [fields] 카탈로그 구성 요소 선택 — 미지정 시 기본값(기존 결과와 동일)
  * @returns {number} 추정 토큰 수
  */
-export function estimateCatalogTokens(mcps) {
-  return Math.round(buildToolCatalog(mcps).length / 2.2);
+export function estimateCatalogTokens(mcps, fields) {
+  return Math.round(buildToolCatalog(mcps, fields).length / 2.2);
+}
+
+/* ------------------------------------------------------------
+   카탈로그 자동 축약 — 예산 초과 시 서버·도구를 하나도 빼지 않고
+   상세도만 단계적으로 낮춰(L1~L4) 예산 안에 넣는다(무음 절단 제거).
+   예산 이내면 L0 = 기존 buildToolCatalog와 완전 동일 출력(회귀 0).
+   ------------------------------------------------------------ */
+
+/** 축약 카탈로그 상단 안내 1줄(L1~L4 공통 — 레벨별 동일 문구로 토큰 부담 최소화) */
+const CATALOG_COMPRESS_NOTICE =
+  '(주의: 컨텍스트 예산에 맞춰 카탈로그가 축약됨 — 파라미터 상세는 도구 실행 결과/오류를 참고)';
+
+/** n자 초과 시 절단 + '…' (카탈로그 축약 전용 — truncate()와 달리 총 길이 표기를 붙이지 않음) */
+function clip(s, n) {
+  s = String(s ?? '');
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+/** L1~L2용 파라미터 표기 — describeParam과 동일하되 enum 값을 4개까지만 표기(초과분 '|…').
+ *  examples는 L1부터 제외되므로(축약 우선순위) 이 함수는 예시값을 표기하지 않는다. */
+function describeParamClipped(name, prop = {}, required = false) {
+  let t = prop.type || 'any';
+  if (prop.type === 'array') t = `array<${prop.items?.type || 'any'}>`;
+  let s = `${name}:${t}`;
+  if (required) s += '*';
+  if (Array.isArray(prop.enum) && prop.enum.length) {
+    s += `(${prop.enum.slice(0, 4).map(String).join('|')}${prop.enum.length > 4 ? '|…' : ''})`;
+  }
+  return s;
+}
+
+/**
+ * 레벨별 축약 카탈로그 생성(내부). 모든 레벨에서 서버·도구는 하나도 빠지지 않는다.
+ * 켜진 fields(r6) 위에서 상세도만 하향한다 — 기본 fields면 각 레벨 출력이 r5와 완전 동일.
+ * - L0: 현행 buildToolCatalog 그대로(출력 동일 보장 — 기존 함수 재사용, fields 반영)
+ * - L1: examples 제외 + 서버 설명 60자·도구 설명 80자 절단, enum 값 4개까지 (outputs는 유지)
+ * - L2: L1 + outputs 제외 + 선택(비필수) 파라미터 제외('*' 표기 불필요), 서버 설명 제거(head만)
+ * - L3: L2 + 파라미터는 필수 이름만(타입·enum 제거), 도구 설명 30자 절단
+ * - L4: 서버당 1줄 — `[id] 서버명: tool1, tool2, …` (설명·파라미터 없음, 헤더 표기줄도 최소화, fields 무관 최소형)
+ */
+function buildCatalogAtLevel(mcps = [], level = 0, fields) {
+  const f = normalizeCatalogFields(fields);
+  if (level <= 0) return buildToolCatalog(mcps, f);
+
+  if (level >= 4) {
+    const lines = [CATALOG_COMPRESS_NOTICE, '(표기: [서버id] 서버명: 도구명 목록)'];
+    for (const server of mcps || []) {
+      if (!server || !server.tools || !server.tools.length) continue;
+      lines.push(`[${server.id}] ${server.nameKo || server.name || ''}: ${server.tools.map(t => t.name).join(', ')}`);
+    }
+    return lines.length > 2 ? lines.join('\n') : '(등록된 도구가 없습니다)';
+  }
+
+  // 축약 우선순위(r6): L1부터 examples 소멸(describeParamClipped가 미표기), L2부터 outputs 소멸
+  const showOutputs = f.outputs && level === 1;
+  // L1~L3 헤더: 켜진 fields와 레벨별 실제 표기 규칙만 안내(기본 fields면 r5 문구와 동일)
+  const lines = [CATALOG_COMPRESS_NOTICE, catalogHeader(f, level)];
+  const toolDescMax = level >= 3 ? 30 : 80; // 도구 설명: L1~L2 80자 · L3 30자
+  for (const server of mcps || []) {
+    if (!server || !server.tools || !server.tools.length) continue;
+    const head = `[${server.id}] ${server.nameKo || server.name || ''}`;
+    // 서버 설명: L1 60자 절단 · L2~L3 제거(head만) — desc 필드가 꺼져 있으면 항상 head만
+    lines.push(f.desc && level === 1 && server.description ? `${head} — ${clip(server.description, 60)}` : head);
+    for (const tool of server.tools) {
+      let line = `  - ${tool.name}`;
+      if (f.params) {
+        const props = tool.inputSchema?.properties || {};
+        const req = new Set(tool.inputSchema?.required || []);
+        let entries = Object.entries(props);
+        if (level >= 2) entries = entries.filter(([n]) => req.has(n)); // 선택(비필수) 파라미터 제외
+        const params = entries
+          .map(([n, p]) => (level >= 3 ? n : describeParamClipped(n, p, level === 1 && req.has(n))))
+          .join(', ');
+        // L2+는 전부 필수라 '*' 불필요, 필수 파라미터가 없으면 '파라미터 없음' 대신 '-'
+        line += `(${params || (level >= 2 ? '-' : '파라미터 없음')})`;
+      }
+      if (f.desc) line += `: ${clip(tool.description || '', toolDescMax)}`;
+      if (showOutputs) {
+        const outs = outputKeys(tool);
+        if (outs) line += ` → 출력: ${outs}`;
+      }
+      lines.push(line);
+    }
+  }
+  return lines.length > 2 ? lines.join('\n') : '(등록된 도구가 없습니다)';
+}
+
+/**
+ * 전체 카탈로그 주입 예산(추정 토큰) — numCtx에서 지시문·응답 여유분을 뺀 값.
+ * react는 히스토리 누적·카탈로그 매턴 재전송을 감안해 여유분을 더 크게 잡는다.
+ * r7: react 차감을 maxSteps에 비례시킴 — `min(floor(numCtx/2), 1536 + 450×clamp(maxSteps||6,1,20))`.
+ *     기본 maxSteps=6이면 4236(≈현행 4096), 스텝이 많을수록 히스토리 여유분을 더 확보하되
+ *     차감이 numCtx의 절반을 넘지 않도록 상한을 둔다. plan은 현행 2048 유지.
+ * @param {number} numCtx Ollama num_ctx
+ * @param {string} [planningMode] 'react'면 maxSteps 비례 차감, 그 외 2048 차감
+ * @param {number} [maxSteps] react 최대 스텝 수(1~20으로 클램프, 미지정/비정상 시 6)
+ * @returns {number} 추정 토큰 예산(최소 1500)
+ */
+export function catalogBudgetTokens(numCtx, planningMode, maxSteps) {
+  const n = Number(numCtx) || 0;
+  let reserve = 2048;
+  if (planningMode === 'react') {
+    const steps = Math.min(Math.max(Math.floor(Number(maxSteps)) || 6, 1), 20);
+    reserve = Math.min(Math.floor(n / 2), 1536 + 450 * steps);
+  }
+  return Math.max(1500, n - reserve);
+}
+
+/**
+ * 예산에 맞는 최소 축약 레벨(L0~L4)의 카탈로그 생성 — 서버·도구 전부 유지, 상세도만 하향.
+ * 예산 이내면 L0(buildToolCatalog와 완전 동일 출력). L4도 초과면 L4 텍스트+level 4를 그대로
+ * 반환한다(초과 여부는 기존 ctxOverflow 로직이 실행 시 감지).
+ * @param {Array} mcps MCP 서버 배열
+ * @param {number} budgetTokens 추정 토큰 예산(catalogBudgetTokens 결과)
+ * @param {object} [fields] 카탈로그 구성 요소 선택 — 미지정 시 기본값(기존 결과와 동일)
+ * @returns {{text:string, level:number, estTokens:number, fullEstTokens:number}}
+ */
+export function buildToolCatalogFitted(mcps = [], budgetTokens = Infinity, fields) {
+  const est = (text) => Math.round(text.length / 2.2); // 기존 관례(estimateCatalogTokens)와 동일 근사
+  const budget = Number.isFinite(Number(budgetTokens)) ? Number(budgetTokens) : Infinity;
+  let text = buildToolCatalog(mcps, fields); // L0 — 기본 fields면 기존 함수 출력과 동일 보장
+  const fullEstTokens = est(text);
+  let estTokens = fullEstTokens;
+  let level = 0;
+  while (estTokens > budget && level < 4) {
+    level += 1;
+    text = buildCatalogAtLevel(mcps, level, fields);
+    estTokens = est(text);
+  }
+  return { text, level, estTokens, fullEstTokens };
+}
+
+/**
+ * r7: 전략이 "전체 도구 카탈로그"를 프롬프트에 주입할 수 있는지 판정(평가 preflight 분류용).
+ * 유효 프롬프트 템플릿(커스텀 또는 기본)에 {{TOOL_CATALOG}}가 포함되고 전체 카탈로그가 주입될 수 있으면 true.
+ * - prompt(full): 유효 systemPrompt에 {{TOOL_CATALOG}} 포함 시 true
+ * - prompt(retrieval)/db: false (검색 축소 카탈로그 주입 — 검색 실패 시의 전체 폴백은 판정에서 제외)
+ * - skill: 유효 셀렉터 템플릿에 {{TOOL_CATALOG}} 포함 시만 true (기본 셀렉터는 미포함 → false)
+ * - rule: onNoMatch='llmFallback'이고 유효 폴백 템플릿에 {{TOOL_CATALOG}} 포함 시만 true
+ * @param {object} strategy Strategy
+ * @returns {boolean}
+ */
+export function usesFullCatalog(strategy) {
+  const cfg = strategy?.config || {};
+  const has = (tpl) => String(tpl || '').includes('{{TOOL_CATALOG}}');
+  switch (strategy?.type) {
+    case 'prompt':
+      if (cfg.catalogMode === 'retrieval') return false;
+      return has(cfg.systemPrompt || DEFAULT_PLANNER_PROMPT);
+    case 'db':
+      return false;
+    case 'skill':
+      return has(cfg.selectorPrompt || DEFAULT_SKILL_SELECTOR_PROMPT);
+    case 'rule': {
+      if ((cfg.onNoMatch || 'error') !== 'llmFallback') return false;
+      // runRule과 동일한 유효 폴백 템플릿 규칙(빈 문자열/공백이면 기본 플래너 프롬프트)
+      const prompt = (cfg.fallbackPrompt && cfg.fallbackPrompt.trim()) ? cfg.fallbackPrompt : DEFAULT_PLANNER_PROMPT;
+      return has(prompt);
+    }
+    default:
+      return false;
+  }
 }
 
 /* ============================================================
    내부 유틸
    ============================================================ */
+
+/**
+ * mcps 전체 도구 수 — 전체 카탈로그 주입 시 suppliedToolCount 기록용.
+ * r8: evaluator가 run.toolCount(실행 시점 전체 도구 수) 기록에 재사용하도록 export.
+ */
+export function countTools(mcps) {
+  return (mcps || []).reduce((s, m) => s + ((m && Array.isArray(m.tools)) ? m.tools.length : 0), 0);
+}
+
+/** fields가 기본 구성(DEFAULT_CATALOG_FIELDS)과 동일한지 — 구성 안내 trace 생략 판단용(단일 참조) */
+function isDefaultCatalogFields(fields) {
+  return Object.keys(DEFAULT_CATALOG_FIELDS).every((k) => !!fields[k] === DEFAULT_CATALOG_FIELDS[k]);
+}
 
 function fillPrompt(tpl, { catalog, query, date }) {
   return String(tpl || '')
@@ -152,11 +407,22 @@ function getPath(obj, path) {
 function createRunContext({ strategy, query, mcps, onTrace, signal }) {
   const cfg = strategy?.config || {};
   const date = new Date().toISOString().slice(0, 10);
-  const catalog = buildToolCatalog(mcps);
+  // r6: 카탈로그 구성 사용자 설정 — cfg.catalog.fields(포함 요소)·cfg.catalog.autoFit(자동 축약).
+  // 설정이 없는 기존 전략은 기본값으로 back-fill되어 현행과 완전 동일하게 동작한다(회귀 0).
+  const cat = cfg.catalog || {};
+  const fields = normalizeCatalogFields(cat.fields); // r7: DEFAULT_CATALOG_FIELDS 단일 참조
+  const autoFit = cat.autoFit !== false;
   const byId = new Map((mcps || []).map(m => [m.id, m]));
+  const maxSteps = clampSteps(cfg.maxSteps, 6);
   // ctxOverflow: 카탈로그 프롬프트가 num_ctx를 초과(추정/실측)해 잘렸을 가능성 — 점수 신뢰도 판단용.
   // retrievalFallback: db 검색이 의도한 방식이 아닌 폴백으로 실행된 사유 문자열(없으면 null).
-  const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false, inputTokens: 0, outputTokens: 0, tokensEstimated: false, ctxOverflow: false, retrievalFallback: null };
+  // catalogDetail: 0=전체 상세(기존과 동일)·카탈로그 미주입 · 1~4=카탈로그 자동 축약 레벨(전체 주입 경로에만 의미).
+  // r7 추가 — retrievedTools: db/retrieval 검색 성공 시 최종 후보 'serverId/toolName' 키 배열(전체 주입/폴백이면 null).
+  //           suppliedToolCount: 플래너에 실제 공급된 도구 수(전체 주입이면 전체 도구 수, 카탈로그 미주입이면 null).
+  // r8 확정 시점 — 검색 성공 값은 ctx.pendingRetrieval에 보관했다가 ctx.fillPrompt가 {{TOOL_CATALOG}}를
+  //           실제 치환하는 시점에 result로 확정한다. 커스텀 프롬프트에 플레이스홀더가 없어 축소 카탈로그가
+  //           끝내 주입되지 않으면 두 값 모두 null 유지(공급되지 않은 후보를 기록하지 않음).
+  const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false, inputTokens: 0, outputTokens: 0, tokensEstimated: false, ctxOverflow: false, retrievalFallback: null, catalogDetail: 0, retrievedTools: null, suppliedToolCount: null };
   // react는 도구 오류를 관찰(observation)로 흘려보내 모델이 회복하도록 두므로 step 오류만으로 실패 처리하지 않는다.
   // prompt·db 모두 planningMode==='react'면 동일하게 처리(db도 프롬프트 실행 경로를 공유).
   const failOnStepError = !((strategy?.type === 'prompt' || strategy?.type === 'db') && cfg.planningMode === 'react');
@@ -170,18 +436,85 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
     try { onTrace && onTrace(ev); } catch { /* 콜백 오류는 무시 */ }
   };
 
+  // ---- r7: 카탈로그 fitted 지연 계산(허위 축약 뱃지 제거) ----
+  // 전체 카탈로그는 {{TOOL_CATALOG}}가 실제 치환되는 프롬프트가 실행될 때 최초 1회만 생성하고,
+  // catalogDetail·'카탈로그 구성'·'카탈로그 자동 축약' trace도 그 시점에만 기록한다.
+  // rule 매치 성공·기본 skill 셀렉터(카탈로그 미포함)는 계산도 기록도 하지 않는다(CPU 절약).
+  let fitCache = null;
+  const computeFit = () => {
+    if (fitCache) return fitCache;
+    // autoFit=true(기본)면 numCtx 예산에 맞춰 축약(예산 이내면 L0=기존 buildToolCatalog와 바이트 단위 동일, 초과 시 L1~L4),
+    // autoFit=false면 축약 없이 선택 fields 그대로 주입(예산 초과 시 절단 가능성은 기존 ctxOverflow 로직이 실행 중 감지).
+    const numCtxForCatalog = getNumCtx();
+    // r7: react면 maxSteps를 예산 차감에 반영(히스토리 누적 여유분 비례)
+    const budget = catalogBudgetTokens(numCtxForCatalog, cfg.planningMode, maxSteps);
+    const fit = autoFit
+      ? buildToolCatalogFitted(mcps, budget, fields)
+      : (() => { const text = buildToolCatalog(mcps, fields); const t = Math.round(text.length / 2.2); return { text, level: 0, estTokens: t, fullEstTokens: t }; })();
+    fitCache = { ...fit, budget, numCtx: numCtxForCatalog };
+    return fitCache;
+  };
+  let catalogMarked = false;
+  /** 전체 카탈로그를 실제 주입하는 시점에 1회 기록: catalogDetail·구성/축약 trace·suppliedToolCount */
+  const materializeFullCatalog = () => {
+    const fit = computeFit();
+    if (!catalogMarked) {
+      catalogMarked = true;
+      result.catalogDetail = fit.level;
+      result.retrievedTools = null; // 전체 주입/폴백 — 검색 후보 아님
+      result.suppliedToolCount = countTools(mcps);
+      // r6: fields가 기본 구성과 다를 때만 구성 안내 trace 1건(기본이면 추가 없음 — 회귀 0)
+      if (!isDefaultCatalogFields(fields)) {
+        const on = ['desc', 'params', 'outputs', 'examples'].filter((k) => fields[k]).join('/');
+        emit('info', `카탈로그 구성: ${on || '(없음)'} 포함 (desc/params/outputs/examples 중 사용자 선택)`);
+      }
+      // 축약이 적용된 경우에만 안내 trace 추가(레벨 0이면 기존과 동일하게 아무 것도 추가하지 않음 — 회귀 0)
+      // autoFit=false 경로는 항상 level 0이므로 축약 trace가 남지 않는다.
+      if (fit.level > 0) {
+        emit('info', `카탈로그 자동 축약: 레벨 ${fit.level} (전체 ≈${fit.fullEstTokens.toLocaleString()}tok → ≈${fit.estTokens.toLocaleString()}tok, 예산 ≈${fit.budget.toLocaleString()}tok/numCtx ${fit.numCtx.toLocaleString()})`);
+      }
+    }
+    return fit.text;
+  };
+
   const ctx = {
-    strategy, query, date, catalog, byId, result, emit, signal, failOnStepError,
+    strategy, query, date, byId, result, emit, signal, failOnStepError,
     allMcps: mcps || [],
+    // 검색(retrieval/db) 성공 시 축소 카탈로그 문자열로 채워진다. null이면 {{TOOL_CATALOG}} 치환 시점에
+    // 전체 카탈로그를 지연 생성·주입한다(위 materializeFullCatalog).
+    catalog: null,
+    // r8: 검색 성공 시 {retrievedTools, suppliedToolCount} 보류분 — fillPrompt의 실제 치환 시점에 result로 확정.
+    pendingRetrieval: null,
     model: strategy?.model || getDefaultModel(),
     temperature: Number.isFinite(cfg.temperature) ? cfg.temperature : 0.2,
     // 스킬 선택·파라미터 생성 등 내부 보조 호출용 온도: 명시 설정(온도 통일 포함)이 있으면 따르고, 없으면 안정성을 위해 0.1
     auxTemperature: Number.isFinite(cfg.temperature) ? cfg.temperature : 0.1,
-    maxSteps: clampSteps(cfg.maxSteps, 6),
+    maxSteps,
     throwIfAborted() { if (signal?.aborted) throw abortError(); },
     fail(msg) { result.ok = false; result.error = msg; emit('error', msg); },
+    /** r7: {{TOOL_CATALOG}} 포함 템플릿일 때만 카탈로그를 (지연) 생성·주입하는 템플릿 치환 */
+    fillPrompt(tpl) {
+      const t = String(tpl || '');
+      const needsCatalog = t.includes('{{TOOL_CATALOG}}');
+      let catalogText = '';
+      if (needsCatalog) {
+        if (ctx.catalog != null) {
+          catalogText = ctx.catalog;
+          // r8: 검색 축소 카탈로그가 실제로 프롬프트에 주입되는 시점에 기록 확정(pending→result).
+          // 플레이스홀더가 없는 템플릿만 쓰이면 이 분기에 오지 않아 retrievedTools/suppliedToolCount는 null 유지.
+          if (ctx.pendingRetrieval) {
+            result.retrievedTools = ctx.pendingRetrieval.retrievedTools;
+            result.suppliedToolCount = ctx.pendingRetrieval.suppliedToolCount;
+            ctx.pendingRetrieval = null;
+          }
+        } else {
+          catalogText = materializeFullCatalog();
+        }
+      }
+      return fillPrompt(t, { catalog: catalogText, query, date });
+    },
     filledSystemPrompt() {
-      let sp = fillPrompt(cfg.systemPrompt || DEFAULT_PLANNER_PROMPT, ctx);
+      let sp = ctx.fillPrompt(cfg.systemPrompt || DEFAULT_PLANNER_PROMPT);
       if (cfg.planningMode === 'react') sp += '\n\n' + REACT_ADDENDUM;
       return sp;
     },
@@ -406,6 +739,90 @@ function reduceMcps(mcps, results) {
   return out;
 }
 
+/** 후보 목록을 'serverId/toolName' 키 배열로(순서 보존·중복 제거) — retrievedTools 기록용 */
+function uniqueToolKeys(list) {
+  const keys = [];
+  const seen = new Set();
+  for (const x of list || []) {
+    const k = `${x.serverId}/${x.toolName}`;
+    if (!seen.has(k)) { seen.add(k); keys.push(k); }
+  }
+  return keys;
+}
+
+/**
+ * r7: 연결어미 절 분리 패턴 — '그리고' / '하고 나서' / '~한 다음(에)' / '~한 뒤(에)' / 보수 연결어미.
+ * r8 품질 게이트: bare '고 ' 분리를 제거하고 어미를 '하고|되고|이고|보고'+공백으로 보수 한정 —
+ * '재고 수량'·'전기차를 몰고' 같은 명사·용언 중간 절단('재고'→'재', '몰고'→'몰')을 금지한다.
+ * lookbehind로 앞말(어간)은 보존하고 연결어미부터 뒤 공백까지만 분리 지점으로 삼는다.
+ */
+const CLAUSE_SPLIT_RE = /\s*(?:,\s*)?그리고\s+|(?<=[가-힣])(?:하고\s*나서|한\s*다음에?|한\s*뒤에?|하고|되고|이고|보고)\s+/;
+
+/**
+ * r8: 문장 분리 패턴 — 마침표(.)는 숫자 사이가 아닐 때만 문장 경계로 취급
+ * ('규모 3.0'·'HS코드 3102.30' 같은 소수점·코드 절단 금지). ?·!·줄바꿈은 기존과 동일.
+ */
+const SENTENCE_SPLIT_RE = /(?:[?!\n]|(?<!\d)\.(?!\d))+/;
+
+/**
+ * r7: 휴리스틱 질의 분해(순수 함수, LLM 호출 없음) — 문장(.?!·줄바꿈) 분리 후 연결어미로 절 분리.
+ * r8 품질 게이트: (a) 숫자 사이 '.' 비분리, (b) bare '고 ' 분리 제거(CLAUSE_SPLIT_RE 참조),
+ * (c) 부질의 최소 길이 6자, (d) 단독 어절(공백 없음) 조각은 8자 미만이면 드랍('수량'·'있어' 등 검색 노이즈 방지).
+ * 부질의 2~5개를 반환하며, 분해 결과가 1개면 [원질의] 그대로 반환한다(호출측이 단일 질의 경로 유지).
+ * @param {string} query 사용자 질의
+ * @returns {string[]} 부질의 배열(항상 1개 이상)
+ */
+export function decomposeQueryHeuristic(query) {
+  const q = String(query || '').trim();
+  if (!q) return [q];
+  const parts = [];
+  for (const sentence of q.split(SENTENCE_SPLIT_RE)) {
+    for (const clause of sentence.split(CLAUSE_SPLIT_RE)) {
+      const c = clause.trim();
+      if (c.length < 6) continue; // r8: 최소 길이 미달 조각 드랍
+      if (!/\s/.test(c) && c.length < 8) continue; // r8: 2어절 미만(단독 용언·조각) + 8자 미만 드랍
+      parts.push(c);
+    }
+  }
+  if (parts.length < 2) return [q];
+  return parts.slice(0, 5);
+}
+
+/**
+ * r7: 멀티 질의 분해 — 복합 질의를 측면별 부질의로 나눈다(vector multiQuery·graph multiSeed 공용).
+ * - heuristic: decomposeQueryHeuristic(문장·연결어미 분리, LLM 호출 없음)
+ * - llm: ctx.llmJSON 1회(JSON 문자열 배열 요청). 실패 시 원질의 1개로 폴백(llmCalls는 llmJSON에서 자연 계상).
+ * trace '질의 분해: N개 (…)'를 남긴다. 반환은 항상 1개 이상.
+ * @param {object} ctx 실행 컨텍스트
+ * @param {'heuristic'|'llm'} mode 분해 방식
+ * @returns {Promise<string[]>}
+ */
+async function decomposeQuery(ctx, mode) {
+  const q = String(ctx.query || '').trim();
+  let subs;
+  if (mode === 'llm') {
+    try {
+      const data = await ctx.llmJSON([
+        { role: 'system', content: '당신은 검색 질의 분해기입니다. 사용자 질의가 여러 작업/측면을 담고 있으면 독립적으로 검색 가능한 2~5개의 부질의로 분해하세요. 단일 작업이면 원 질의 하나만 담으세요. 반드시 JSON 문자열 배열(예: ["부질의1","부질의2"]) 하나만 출력합니다. 설명·코드블록은 금지합니다.' },
+        { role: 'user', content: q },
+      ], { temperature: ctx.auxTemperature });
+      const arr = Array.isArray(data) ? data
+        : Array.isArray(data?.queries) ? data.queries
+          : Array.isArray(data?.subQueries) ? data.subQueries : null;
+      const cleaned = (arr || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+      subs = cleaned.length >= 2 ? cleaned : [q];
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      ctx.emit('info', `⚠ 질의 분해(LLM) 실패 — 원질의 1개로 계속: ${e.message}`);
+      subs = [q];
+    }
+  } else {
+    subs = decomposeQueryHeuristic(q);
+  }
+  ctx.emit('info', `질의 분해: ${subs.length}개 (${subs.map((s) => clip(s, 30)).join(' | ')})`);
+  return subs;
+}
+
 /**
  * 벡터/키워드 검색으로 ctx.catalog를 축소 카탈로그로 교체.
  * - 하위호환 prompt(catalogMode='retrieval')은 config.retrieval을,
@@ -421,26 +838,41 @@ async function applyCatalogRetrieval(ctx, opts = {}) {
   const method = r.method || 'hybrid';
   const topK = Number(r.topK) > 0 ? Math.floor(Number(r.topK)) : 8;
 
+  // r7: 멀티 질의 분해(multiQuery) — 켜져 있고 catalogIndex가 retrieveMulti를 제공(F2 병렬 구현)할 때만.
+  // retrieveMulti 부재 시에는 multiQuery를 조용히 무시하고 기존 단일 질의 경로로 동작한다.
+  const mq = r.multiQuery || {};
+  let subQueries = null;
+  if (mq.on && typeof catalogIndexApi.retrieveMulti === 'function') {
+    const subs = await decomposeQuery(ctx, mq.mode === 'llm' ? 'llm' : 'heuristic');
+    if (subs.length > 1) subQueries = subs; // 1개면 분해 무의미 — 기존 경로
+  }
+
+  const retrieveOpts = {
+    mcps: ctx.allMcps,
+    method,
+    topK,
+    threshold: Number.isFinite(r.threshold) ? r.threshold : 0,
+    hybridAlpha: Number.isFinite(r.hybridAlpha) ? r.hybridAlpha : 0.5,
+    // r7: hybrid 융합 방식(값만 전달, 적용은 catalogIndex 담당) — 'weighted'(기본, 현행)|'rrf'
+    hybridFusion: r.hybridFusion === 'rrf' ? 'rrf' : 'weighted',
+    expandServer: r.expandServer !== false,
+    expandCategory: !!r.expandCategory,
+    embedModel: r.embedModel || 'bge-m3:latest',
+    // MMR 다양성 재랭킹 파라미터(값만 전달, 재랭킹 구현은 catalogIndex 담당).
+    // 1.0=관련도만(현행, MMR off), 0.0=다양성 최대. 미설정 시 1.0으로 방어.
+    mmrLambda: Number.isFinite(r.mmrLambda) ? r.mmrLambda : 1.0,
+    // 문서 필드 구성(값만 전달, flatten/색인 구성은 catalogIndex 담당). 미지정(undefined)이면
+    // catalogIndex가 인덱스 구축값으로 방어하므로 stale 판정·검색이 정합적으로 동작한다.
+    docFields: r.docFields,
+    signal: ctx.signal,
+  };
   const t0 = performance.now();
   let res;
   try {
-    res = await retrieve(ctx.query, {
-      mcps: ctx.allMcps,
-      method,
-      topK,
-      threshold: Number.isFinite(r.threshold) ? r.threshold : 0,
-      hybridAlpha: Number.isFinite(r.hybridAlpha) ? r.hybridAlpha : 0.5,
-      expandServer: r.expandServer !== false,
-      expandCategory: !!r.expandCategory,
-      embedModel: r.embedModel || 'bge-m3:latest',
-      // MMR 다양성 재랭킹 파라미터(값만 전달, 재랭킹 구현은 catalogIndex 담당).
-      // 1.0=관련도만(현행, MMR off), 0.0=다양성 최대. 미설정 시 1.0으로 방어.
-      mmrLambda: Number.isFinite(r.mmrLambda) ? r.mmrLambda : 1.0,
-      // 문서 필드 구성(값만 전달, flatten/색인 구성은 catalogIndex 담당). 미지정(undefined)이면
-      // catalogIndex가 인덱스 구축값으로 방어하므로 stale 판정·검색이 정합적으로 동작한다.
-      docFields: r.docFields,
-      signal: ctx.signal,
-    });
+    // 멀티 질의: 부질의별 retrieve(perK) 후 라운드로빈 병합→topK(구현은 catalogIndex.retrieveMulti 담당)
+    res = subQueries
+      ? await catalogIndexApi.retrieveMulti(subQueries, { ...retrieveOpts, perK: Number(mq.perK) > 0 ? Math.floor(Number(mq.perK)) : 4 })
+      : await retrieve(ctx.query, retrieveOpts);
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
     ctx.result.totalLatencyMs += performance.now() - t0; // 임베딩 시도 지연도 총 지연에 포함
@@ -465,7 +897,13 @@ async function applyCatalogRetrieval(ctx, opts = {}) {
   }
 
   const reduced = reduceMcps(ctx.allMcps, results);
+  // r6 fields는 의도적으로 적용하지 않음(기본 구성 고정) — 검색 축소 카탈로그는 소수(topK) 도구의 상세 유지가 목적.
   ctx.catalog = buildToolCatalog(reduced);
+  // 검색 축소(topK 소수) 카탈로그는 '전체 주입 축약'이 아니므로 상세도 표시를 0으로 재설정
+  ctx.result.catalogDetail = 0;
+  // r7: 검색 성공 — 최종 후보 키·실공급 도구 수(평가 retrievalRecall 계산용).
+  // r8: pending에 보관 — ctx.fillPrompt가 {{TOOL_CATALOG}}를 실제 치환할 때 result로 확정(미치환이면 null 유지).
+  ctx.pendingRetrieval = { retrievedTools: uniqueToolKeys(results), suppliedToolCount: countTools(reduced) };
 
   const detail = {
     method: res.usedMethod,
@@ -550,6 +988,17 @@ async function applyGraphRetrieval(ctx) {
   const seedK = Number(g.seedK) > 0 ? Math.floor(Number(g.seedK)) : 5;
   const maxDegree = Number(g.maxDegree) > 0 ? Math.floor(Number(g.maxDegree)) : 12;
   const topKForGraph = Number(g.topK) > 0 ? Math.floor(Number(g.topK)) : 8;
+
+  // r7: 멀티 시드 분해(multiSeed) — 켜져 있으면 부질의를 graphRetrieve의 queries로 전달(부질의별 시드·
+  // relevance max-병합은 catalogGraph(F2) 담당). 구버전 graphRetrieve는 미지의 옵션을 무시하므로
+  // 미구현 상태에서도 기존 단일 질의 경로와 동일하게 동작한다.
+  const ms = g.multiSeed || {};
+  let seedQueries = null;
+  if (ms.on) {
+    const subs = await decomposeQuery(ctx, ms.mode === 'llm' ? 'llm' : 'heuristic');
+    if (subs.length > 1) seedQueries = subs; // 1개면 분해 무의미 — 기존 경로
+  }
+
   const t0 = performance.now();
   let res;
   try {
@@ -568,6 +1017,14 @@ async function applyGraphRetrieval(ctx) {
       // hubNorm: 확산 시 허브 degree 정규화(1/√deg) on/off. undefined면 기본 true로 방어.
       maxDegree,
       hubNorm: g.hubNorm !== false,
+      // r7 그래프 블렌드 파라미터(값만 전달, 적용은 catalogGraph 담당 — 기본값은 현행 상수와 동일).
+      // relBonus: 관련도 블렌드 가중(기본 0.5) · relevanceK: 시드 relevance 상위 K(기본 15) ·
+      // includeRelTopN: relevance 상위 N을 그래프 비도달이어도 후보 편입(기본 0=현행 off).
+      relBonus: Number.isFinite(g.relBonus) ? g.relBonus : 0.5,
+      relevanceK: Number(g.relevanceK) > 0 ? Math.floor(Number(g.relevanceK)) : 15,
+      includeRelTopN: Number(g.includeRelTopN) > 0 ? Math.floor(Number(g.includeRelTopN)) : 0,
+      // r7 멀티 시드: 부질의 배열(없으면 undefined — 기존 단일 질의 경로)
+      queries: seedQueries || undefined,
       signal: ctx.signal,
     });
   } catch (e) {
@@ -655,7 +1112,13 @@ async function applyGraphRetrieval(ctx) {
   if (candidates.length > topKForGraph) candidates = candidates.slice(0, topKForGraph);
 
   const reduced = reduceMcps(ctx.allMcps, candidates);
+  // r6 fields는 의도적으로 적용하지 않음(기본 구성 고정) — 검색 축소 카탈로그는 소수(topK) 도구의 상세 유지가 목적.
   ctx.catalog = buildToolCatalog(reduced);
+  // 검색 축소(topK 소수) 카탈로그는 '전체 주입 축약'이 아니므로 상세도 표시를 0으로 재설정
+  ctx.result.catalogDetail = 0;
+  // r7: 검색 성공 — 최종 후보(경로추천 반영 후) 키·실공급 도구 수(평가 retrievalRecall 계산용).
+  // r8: pending에 보관 — ctx.fillPrompt가 {{TOOL_CATALOG}}를 실제 치환할 때 result로 확정(미치환이면 null 유지).
+  ctx.pendingRetrieval = { retrievedTools: uniqueToolKeys(candidates), suppliedToolCount: countTools(reduced) };
 
   const hops = Number(g.hops) > 0 ? Math.floor(Number(g.hops)) : 2;
   // P3: 상세(detail.tools)와 카운트를 최종 candidates 기준으로 표기 — 경로추천으로 추가된 도구도 목록에 반영(카운트·목록 일치).
@@ -784,9 +1247,10 @@ async function runSkill(ctx) {
   const skillList = skills.map((s, i) =>
     `${i + 1}. id:"${s.id}" | 이름:${s.name || '-'} | 트리거:${s.trigger || '-'} | 설명:${s.description || '-'}`).join('\n');
 
-  // selectorPrompt는 {{TOOL_CATALOG}}/{{QUERY}}/{{DATE}}에 더해 {{SKILLS}}(스킬 목록)도 지원
+  // selectorPrompt는 {{TOOL_CATALOG}}/{{QUERY}}/{{DATE}}에 더해 {{SKILLS}}(스킬 목록)도 지원.
+  // r7: 기본 셀렉터(카탈로그 미포함)는 ctx.fillPrompt가 카탈로그를 생성하지 않는다(지연 계산 — 계산·기록 없음).
   const rawPrompt = cfg.selectorPrompt || DEFAULT_SKILL_SELECTOR_PROMPT;
-  const sys = fillPrompt(rawPrompt, ctx).replaceAll('{{SKILLS}}', skillList);
+  const sys = ctx.fillPrompt(rawPrompt).replaceAll('{{SKILLS}}', skillList);
   const messages = [{ role: 'system', content: sys }];
 
   // 프롬프트에 스킬 목록/질의 플레이스홀더가 없으면 사용자 메시지로 보강
@@ -850,7 +1314,8 @@ async function runRule(ctx) {
     ctx.emit('info', 'LLM 플래너로 폴백합니다.');
     const prompt = (cfg.fallbackPrompt && cfg.fallbackPrompt.trim()) ? cfg.fallbackPrompt : DEFAULT_PLANNER_PROMPT;
     const queryIncluded = /\{\{\s*QUERY\s*\}\}/.test(prompt);
-    await executePlan(ctx, await planLLM(ctx, fillPrompt(prompt, ctx), { queryIncluded }), '폴백 플래너');
+    // r7: ctx.fillPrompt — 폴백 프롬프트가 {{TOOL_CATALOG}}를 포함할 때만 이 시점에 카탈로그 생성·기록
+    await executePlan(ctx, await planLLM(ctx, ctx.fillPrompt(prompt), { queryIncluded }), '폴백 플래너');
   } else {
     ctx.fail('매치되는 룰이 없어 실행을 종료합니다 (onNoMatch: error).');
   }

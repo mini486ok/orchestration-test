@@ -6,6 +6,10 @@
 //  graphStatus(mcps, benchmarks, embedModel)         존재/stale/노드수/유형별 엣지수/semantic 사용 여부
 //  effectiveAdjacency(graph, edgeParams, {maxDegree,hubNorm})  런타임 파라미터로 유효 가중 인접리스트 구성
 //  graphRetrieve(query, {..., maxDegree, hubNorm})   시드 → 그래프 확산 → topK 도구 검색
+//    §F2 옵션: queries[](멀티 시드 — 부질의별 라운드로빈 시드 선정 + 전역 정규화 relevance 병합, §H1),
+//    relBonus(기본 0.5)·relevanceK(기본 15)·includeRelTopN(기본 0 — >0이면 "시드(seedK) 제외" 관련도
+//    상위 N을 최종 topK에 보장 포함(비후보는 rel*relBonus로 편입, 절단 탈락분은 시드·창이 아닌 최하위
+//    후보와 교체 — 시드는 보호), 유효 상한 min(N, relevanceK−seedK), §H1)
 //  recommendPaths(query, {..., edges, beamWidth, maxLen})  방향(io/llm) 엣지 빔서치 워크플로우 경로 추천
 //
 // 도구 식별자 = `${serverId}/${toolName}`. 노드 목록 = flattenTools(mcps) 순서(등록 순).
@@ -662,7 +666,12 @@ export function effectiveAdjacency(graph, edgeParams = {}, opts = {}) {
  * 시드 도구 집합 + (더 넓은) 질의 관련도 맵을 얻는다. 반환 score는 max 정규화(0~1, 최상위=1).
  * expandServer/Category는 끄고 순수 매치만 사용(확장은 그래프의 역할). relevanceK로 시드보다 넓게 조회해
  * 그래프 도달 노드/경로 노드에 질의 관련도를 소폭 블렌드하는 데 쓴다(G1).
- * @returns {{seeds:Array<{serverId,toolName,score}>, relevance:Map<string,number>, usedMethod, fallbackReason}}
+ * ranked: relevance와 같은 내용의 관련도 내림차순 배열(필드 보존) — includeRelTopN 편입·부질의 병합용(§F2).
+ * rawTop: 정규화 전 최고 원점수(retrieve score 기준) — 멀티 시드 병합 시 부질의 간 스케일 가중용(§H1).
+ *   정규화값 × rawTop = 원점수이므로, 부질의별 정규화값에 (해당 부질의 rawTop / 전역 최대 rawTop)을
+ *   곱하면 병합 후 전역 1회 정규화와 동치가 된다.
+ * @returns {{seeds:Array<{serverId,toolName,score}>, relevance:Map<string,number>,
+ *   ranked:Array<{serverId,toolName,score}>, rawTop:number, usedMethod, fallbackReason}}
  */
 async function seedRetrieve(query, { mcps, method, seedK, embedModel, signal, relevanceK }) {
   const K = Math.max(1, Math.floor(seedK) || 5);
@@ -680,7 +689,7 @@ async function seedRetrieve(query, { mcps, method, seedK, embedModel, signal, re
   }));
   const seeds = ranked.slice(0, K);
   const relevance = new Map(ranked.map(r => [`${r.serverId}/${r.toolName}`, r.score]));
-  return { seeds, relevance, usedMethod: res.usedMethod, fallbackReason: res.fallbackReason || null };
+  return { seeds, relevance, ranked, rawTop: maxScore, usedMethod: res.usedMethod, fallbackReason: res.fallbackReason || null };
 }
 
 /* ============================================================
@@ -692,29 +701,105 @@ async function seedRetrieve(query, { mcps, method, seedK, embedModel, signal, re
  * @param {string} query
  * @param {{mcps:Array, graph:object, edgeParams:object, seedMethod?:string, seedK?:number,
  *          hops?:number, decay?:number, topK?:number, embedModel?:string,
- *          maxDegree?:number, hubNorm?:boolean, signal?:AbortSignal}} opts
+ *          maxDegree?:number, hubNorm?:boolean, queries?:string[], relBonus?:number,
+ *          relevanceK?:number, includeRelTopN?:number, signal?:AbortSignal}} opts
  *   maxDegree(기본 12): effectiveAdjacency의 노드당 방향 out-degree 상한(런타임 축소).
  *   hubNorm(기본 true): 확산 기여를 허브 정규화(w/√deg)할지 여부. false면 정규화 없이 w 그대로(현행=true).
+ *   queries(§F2, 선택): 부질의 배열(멀티 시드). 있으면 부질의별로 시드 검색을 수행해 시드는 부질의별
+ *     "라운드로빈"(각 부질의 ranked 1위부터 교차·중복 제거, seedK개 — §H1)으로 선정하고, 질의 관련도
+ *     (relevance)는 부질의 top-raw 비율로 가중한 뒤 노드별 max 병합(전역 1회 정규화와 동치 — §H1)해
+ *     기존 확산을 그대로 진행한다. 미지정/빈 배열이면 query 단일 시드(현행).
+ *   relBonus(§F2, 기본 0.5=GRAPH_REL_BONUS): 그래프 도달(비시드) 노드에 블렌드하는 질의 관련도 계수.
+ *   relevanceK(§F2, 기본 15=SEED_RELEVANCE_K): 시드보다 넓게 확보하는 질의 관련도 맵 크기.
+ *   includeRelTopN(§F2, 기본 0=현행): >0이면 "시드(seedK) 제외" 질의 관련도 상위 N개를 최종 topK 후보에
+ *     보장 포함 — 그래프 확산이 놓친 고관련 도구의 안전망. 후보에 없는 노드는 rel*relBonus 점수
+ *     (source:'relevance', hop:null)로 편입하고, topK 절단에서 탈락하는 창 노드는 시드·창이 아닌 최하위
+ *     후보와 교체해 살린다(시드는 보호 — topK가 시드+창으로 포화면 일부 창 노드는 미포함 가능).
+ *     유효 상한은 relevanceK와 연동: min(N, relevanceK−seedK) (§H1 의미 수정 — 종전
+ *     "관련도 상위 N"은 상위 seedK개가 항상 시드와 겹쳐 N≤seedK면 구조적 no-op이었고, 편입 점수가
+ *     확산 점수보다 항상 낮아 절단 보장 없이는 실질 no-op이었다).
  * @returns {Promise<{results:Array, seeds:Array, relevance:Map<string,number>, usedEmbed:boolean, fallbackReason:string|null}>}
  *   relevance: 시드 검색에서 이미 계산한 (더 넓은) 질의 관련도 맵(`serverId/toolName`→0~1).
  *   recommendPaths에 그대로 넘기면 시드 이중 임베딩(질의 임베딩 2회)을 피할 수 있다(하위호환: 추가 필드).
  */
 export async function graphRetrieve(query, {
   mcps = [], graph, edgeParams = {}, seedMethod = 'hybrid', seedK = 5, hops = 2,
-  decay = 0.5, topK = 8, embedModel = DEFAULT_EMBED_MODEL, maxDegree, hubNorm, signal,
+  decay = 0.5, topK = 8, embedModel = DEFAULT_EMBED_MODEL, maxDegree, hubNorm,
+  queries, relBonus, relevanceK, includeRelTopN, signal,
 } = {}) {
   const q = String(query || '').trim();
   const k = Math.max(1, Math.floor(topK) || 8);
   embedModel = embedModel || DEFAULT_EMBED_MODEL; // config에서 null이 넘어오면 임베딩 기본값
   const md = Number.isFinite(maxDegree) ? Math.max(1, Math.floor(maxDegree)) : DEFAULT_MAX_DEGREE;
   const hn = hubNorm === undefined ? true : !!hubNorm; // 허브 정규화(1/√deg) 기본 on(현행)
+  // §F2 옵션화 — 미지정 시 기존 상수와 동일(회귀 없음).
+  const relB = Number.isFinite(relBonus) ? Math.max(0, relBonus) : GRAPH_REL_BONUS;
+  const relK = Number.isFinite(relevanceK) ? Math.max(1, Math.floor(relevanceK)) : SEED_RELEVANCE_K;
+  const relTopN = Number.isFinite(includeRelTopN) ? Math.max(0, Math.floor(includeRelTopN)) : 0;
+  const sK = Math.max(1, Math.floor(seedK) || 5); // seedRetrieve와 동일 클램프 — 라운드로빈 시드·relTopN 오프셋용
   const gnodes = (graph && Array.isArray(graph.nodes)) ? graph.nodes : [];
   const keyToNode = new Map(gnodes.map((n, i) => [`${n.serverId}/${n.toolName}`, i]));
 
-  // 1) 시드 (+ 넓은 질의 관련도 맵)
+  // 1) 시드 (+ 넓은 질의 관련도 맵) — queries[](멀티 시드)면 부질의별 시드·relevance를 max-병합(§F2)
+  const subQs = (Array.isArray(queries) ? queries : []).map(s => String(s || '').trim()).filter(Boolean);
+  const qList = subQs.length ? subQs : [q];
   let seedInfo;
   try {
-    seedInfo = await seedRetrieve(q, { mcps, method: seedMethod, seedK, embedModel, signal, relevanceK: SEED_RELEVANCE_K });
+    const infos = [];
+    for (const sq of qList) {
+      // 순차 실행: AbortSignal 전파·임베딩 호출 순서를 결정적으로 유지.
+      infos.push(await seedRetrieve(sq, { mcps, method: seedMethod, seedK, embedModel, signal, relevanceK: relK }));
+    }
+    if (infos.length === 1) {
+      seedInfo = infos[0]; // 단일 질의 = 현행 경로 그대로
+    } else {
+      // §H1 멀티 시드 병합 —
+      // (a) 시드는 부질의별 "라운드로빈"(각 부질의 ranked 1위부터 교차·중복 제거)으로 seedK개만 선정해
+      //     측면 대표성을 보장한다. 종전(부질의별 시드 합집합)은 최대 n×seedK개가 각자 1.0 근처 점수로
+      //     투입돼 노이즈 부질의의 조각이 확산을 지배했다(#9/#30 극단 악화의 원인).
+      // (b) relevance/ranked는 노드별 max-병합하되, 부질의별 정규화값(각자 최고점=1)을 그대로 합치지 않고
+      //     "해당 부질의 rawTop / 전역 최대 rawTop" 비율로 가중한다 — 정규화값×rawTop=원점수이므로 병합 후
+      //     전역 1회 정규화와 동치(§H1). 노이즈 조각이 만점 시드가 되는 문제를 완화한다. 단 retrieve의
+      //     hybrid 점수는 부질의 내부 minmax 정규화를 거친 값이라 완전한 절대 스케일은 아니며,
+      //     top-raw 가중으로 부질의 간 상대 스케일 차이까지만 반영한다.
+      const globalTop = infos.reduce((m, i) => Math.max(m, i.rawTop || 0), 0);
+      const rankByKey = new Map();
+      for (const info of infos) {
+        const scale = globalTop > 0 ? (info.rawTop || 0) / globalTop : 1;
+        for (const r of info.ranked || []) {
+          const key = `${r.serverId}/${r.toolName}`;
+          const sc = (r.score || 0) * scale;
+          if (!rankByKey.has(key) || sc > rankByKey.get(key).score) {
+            rankByKey.set(key, { serverId: r.serverId, toolName: r.toolName, score: sc });
+          }
+        }
+      }
+      const relevance = new Map([...rankByKey.entries()].map(([key, r]) => [key, r.score]));
+      // 라운드로빈 시드: 부질의1의 1위 → 부질의2의 1위 → … → 부질의1의 2위 → … (중복 제거, seedK개).
+      // 점수는 병합(전역 정규화) 값, 순서는 교차 채택 순서(=선정 우선순위)를 유지한다.
+      const seeds = [];
+      const seenSeed = new Set();
+      const maxRankLen = infos.reduce((m, i) => Math.max(m, (i.ranked || []).length), 0);
+      outer: for (let i = 0; i < maxRankLen; i++) {
+        for (const info of infos) {
+          const r = (info.ranked || [])[i];
+          if (!r) continue;
+          const key = `${r.serverId}/${r.toolName}`;
+          if (seenSeed.has(key)) continue;
+          seenSeed.add(key);
+          seeds.push({ serverId: r.serverId, toolName: r.toolName, score: rankByKey.get(key)?.score || 0 });
+          if (seeds.length >= sK) break outer;
+        }
+      }
+      const reasons = [...new Set(infos.map(i => i.fallbackReason).filter(Boolean))];
+      seedInfo = {
+        seeds,
+        ranked: [...rankByKey.values()].sort((x, y) => y.score - x.score),
+        relevance,
+        usedMethod: infos[0].usedMethod, // 폴백은 인덱스 상태에 좌우 → 부질의 간 동일(첫 결과 기준)
+        fallbackReason: reasons.length ? `부질의 ${qList.length}개 병합: ${reasons.join(' / ')}` : null,
+      };
+    }
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
     // relevance 필드는 실패 경로에서도 항상 포함해 반환 형태를 일정하게 유지(소비자 방어).
@@ -797,18 +882,75 @@ export async function graphRetrieve(query, {
     } else {
       // G1: 그래프로 도달한(비시드) 노드에 질의 관련도를 소폭 블렌드(SPEC §3의 α*검색점수 일반화).
       // 관련도는 relByNode에 있을 때만 더하므로 새 노드를 끌어오지 않고, 관련 도구의 순위만 끌어올린다.
+      // 계수는 relBonus 옵션(기본 GRAPH_REL_BONUS=0.5 — 현행과 동일).
       const rel = relByNode.get(ni) || 0;
       resultMap.set(key, {
-        serverId: n.serverId, toolName: n.toolName, score: round4(sc + GRAPH_REL_BONUS * rel),
+        serverId: n.serverId, toolName: n.toolName, score: round4(sc + relB * rel),
         source: 'graph', hop: hopByNode.get(ni) || 1, viaEdges: [...(viaByNode.get(ni) || [])],
       });
     }
   }
 
-  // 4) 정렬 · topK
-  const results = [...resultMap.values()]
-    .sort((a, b) => (b.score - a.score) || (a.hop - b.hop))
-    .slice(0, k);
+  // 3.5) includeRelTopN(§F2, 기본 0=현행 — 이 블록 미실행): "시드(seedK) 제외" 질의 관련도 상위 N개를
+  // 최종 후보(topK)에 보장 포함한다 — 그래프 확산이 놓친 고관련 도구의 안전망(§H1 의미 수정).
+  //  - 종전 "관련도 상위 N"은 상위 seedK개가 항상 시드와 겹쳐 N≤seedK면 구조적 no-op이었다. 시드를
+  //    건너뛴(오프셋) 창에서 N개를 취한다. 유효 상한은 relevanceK와 연동: ranked 자체가 relevanceK개
+  //    뿐이므로 창은 min(N, relevanceK−seedK)개다.
+  //  - 창의 비후보 노드는 rel*relBonus 점수(source:'relevance', hop:null)로 편입한다. 이미 후보(그래프
+  //    도달)면 점수·출처는 그대로 두고 창만 소모한다(조밀한 그래프에서는 고관련 노드 대부분이 이미
+  //    도달 상태 — 편입만으로는 여전히 no-op이 된다).
+  //  - 보장: 창 노드가 topK 절단에서 탈락하면 아래 4)에서 시드·창이 아닌 최하위 후보와 교체해 살린다.
+  //    편입 점수(rel*relBonus)는 시드·확산 점수보다 낮아 절단 경쟁에서 항상 지므로, 보장 없이는 이
+  //    옵션이 사실상 동작하지 않는다(안전망 취지). 시드는 교체 대상이 아니다(아래 4) 주석 참조).
+  const relWindow = [];       // 창 노드 키(관련도 순) — 4)의 보장 교체용
+  if (relTopN > 0 && Array.isArray(seedInfo.ranked)) {
+    const effN = Math.min(relTopN, Math.max(0, relK - sK));
+    const seedKeys = new Set(seedInfo.seeds.map(s => `${s.serverId}/${s.toolName}`));
+    for (const r of seedInfo.ranked) {
+      if (relWindow.length >= effN) break;
+      const key = `${r.serverId}/${r.toolName}`;
+      if (seedKeys.has(key)) continue; // 시드 제외(오프셋) — 창을 소모하지 않음
+      relWindow.push(key);
+      if (resultMap.has(key)) continue; // 이미 후보면 편입만 생략(창은 소모, 보장은 적용)
+      resultMap.set(key, {
+        serverId: r.serverId, toolName: r.toolName, score: round4(relB * (r.score || 0)),
+        source: 'relevance', hop: null, viaEdges: [],
+      });
+    }
+  }
+
+  // 4) 정렬 · topK (hop이 없는 relevance 편입 노드는 tiebreak에서 뒤로 — 기존 노드는 모두 숫자 hop이라 무영향)
+  const byScore = (a, b) => (b.score - a.score) || ((a.hop ?? Number.MAX_SAFE_INTEGER) - (b.hop ?? Number.MAX_SAFE_INTEGER));
+  const results = [...resultMap.values()].sort(byScore).slice(0, k);
+  // §H1 includeRelTopN 보장: 창(시드 제외 관련도 상위 effN) 노드가 절단으로 탈락했으면 "시드도 창도
+  // 아닌" 최하위 후보와 교체해 topK 안에 살린다(관련도 순으로, 교체 가능한 후보가 없어지면 중단).
+  //  - 시드는 교체 대상에서 제외한다: 창 노드는 정의상 시드보다 관련도 순위가 낮으므로, 시드를 밀어내면
+  //    관련도 상위(정답일 확률이 높은) 후보를 하위 창 노드가 대체하는 역전이 된다(실측 시 평균 리콜 악화).
+  //    따라서 창은 그래프 확산이 채운 저관련 꼬리 후보와만 자리를 다툰다. topK가 시드+창으로 포화라면
+  //    일부 창 노드는 못 들어올 수 있다(topK 증가 또는 seedK 축소로 완화 — 주석으로 계약 고정).
+  //  - relTopN=0(기본)이면 relWindow가 비어 이 블록은 실행되지 않는다(회귀 없음). 교체 후 점수 내림차순 복원.
+  if (relWindow.length && results.length === k) {
+    const windowSet = new Set(relWindow);
+    const inTop = new Set(results.map(r => `${r.serverId}/${r.toolName}`));
+    let changed = false;
+    for (const wk of relWindow) {
+      if (inTop.has(wk)) continue;
+      const cand = resultMap.get(wk);
+      if (!cand) continue;
+      let idx = -1; // 뒤(최하위)에서부터 시드·창이 아닌 첫 후보를 찾는다
+      for (let i = results.length - 1; i >= 0; i--) {
+        if (results[i].source === 'seed') continue; // 시드 보호
+        if (!windowSet.has(`${results[i].serverId}/${results[i].toolName}`)) { idx = i; break; }
+      }
+      if (idx < 0) break; // 남은 후보가 전부 시드/창 — 더 살릴 자리가 없음
+      inTop.delete(`${results[idx].serverId}/${results[idx].toolName}`);
+      results.splice(idx, 1);
+      results.push(cand);
+      inTop.add(wk);
+      changed = true;
+    }
+    if (changed) results.sort(byScore);
+  }
 
   if (!gnodes.length) fallbackReason = fallbackReason || '그래프가 없어 시드 검색 결과만 반환';
   else if (!adj.size) fallbackReason = fallbackReason || '유효 엣지가 없어(엣지 off/임계값) 시드 검색 결과만 반환';

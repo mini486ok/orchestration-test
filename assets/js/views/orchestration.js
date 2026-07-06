@@ -5,8 +5,13 @@ import {
   el, uuid, toast, modal, confirmDialog, badge, field, segmented,
   jsonEditor, emptyState, downloadJSON, pickJSONFile, fmt, workflowChips,
 } from '../core/ui.js';
-import { listModels, checkConnection } from '../services/ollama.js';
-import { executeStrategy, buildToolCatalog, DEFAULT_PLANNER_PROMPT, DEFAULT_SKILL_SELECTOR_PROMPT } from '../services/orchestrator.js';
+import { listModels, checkConnection, getNumCtx } from '../services/ollama.js';
+import {
+  executeStrategy, buildToolCatalog, DEFAULT_PLANNER_PROMPT, DEFAULT_SKILL_SELECTOR_PROMPT,
+  // r6/r7: 카탈로그 예상 토큰·자동 축약 미리보기·기본 fields 상수.
+  // 정적 import는 export 부재 시 모듈 로드 자체가 실패하므로 사용처 typeof 가드는 무의미 → 제거(r7 §F5-4).
+  estimateCatalogTokens, catalogBudgetTokens, buildToolCatalogFitted, DEFAULT_CATALOG_FIELDS,
+} from '../services/orchestrator.js';
 import { buildIndex, indexStatus } from '../services/catalogIndex.js';
 
 const TYPE_META = {
@@ -122,6 +127,9 @@ export async function render(container, ctx) {
       // v2 신규(§2): 임베딩 문서 구성 토글 + MMR 다양성. 기본값은 현행과 동일(desc+params 포함, MMR off).
       docFields: { desc: true, params: true, outputs: false, examples: false, tags: false },
       mmrLambda: 1.0,   // 1.0=관련도만(MMR off) · 0.0=다양성 최대. 검색 시점 적용(재색인 불필요).
+      // r7 신규(§F5): 기본값=현행 동작(회귀 0).
+      hybridFusion: 'weighted',                          // 'weighted'=α 가중합(현행) · 'rrf'=순위 역수 융합
+      multiQuery: { on: false, mode: 'heuristic', perK: 4 }, // 복합 질의 분해 후 부질의별 검색·라운드로빈 병합
     };
   }
   function defaultGraphCfg() {
@@ -140,7 +148,13 @@ export async function render(container, ctx) {
       // v2 신규(§3): degree 상한 · 허브 정규화 · 경로 추천 파라미터.
       maxDegree: 12,       // 노드별 최대 연결(io 출력 상한 포함). effectiveAdjacency 캡.
       hubNorm: true,       // 확산 시 허브 degree 정규화(1/√deg) on/off.
-      path: { beamWidth: 6, maxLen: 4, edges: ['io'] },  // recommendPaths 빔 폭/최대 길이/사용 엣지.
+      // r7(§F5-3): beamWidth 기본 6→10(스펙 승인) — 신규 전략에만 적용, 기존 전략 back-fill은 구 기본 6 유지.
+      path: { beamWidth: 10, maxLen: 4, edges: ['io'] }, // recommendPaths 빔 폭/최대 길이/사용 엣지.
+      // r7 신규(§F5): 기본값=현행 엔진 상수와 동일(회귀 0).
+      multiSeed: { on: false, mode: 'heuristic' },       // 부질의별 시드 검색·relevance max-병합(graphRetrieve queries)
+      relBonus: 0.5,       // 그래프 도달(비시드) 노드 점수에 질의 관련도를 블렌드하는 비중(현행 GRAPH_REL_BONUS)
+      relevanceK: 15,      // 시드보다 넓게 확보할 질의 관련도 후보 수(현행 SEED_RELEVANCE_K)
+      includeRelTopN: 0,   // >0이면 시드(seedK) 제외 relevance 상위 N개를 그래프 비도달이어도 후보 편입(0=off · 유효 상한 relevanceK−seedK)
     };
   }
 
@@ -151,20 +165,58 @@ export async function render(container, ctx) {
     if (!v.docFields || typeof v.docFields !== 'object') v.docFields = { ...d.docFields };
     else for (const k in d.docFields) if (typeof v.docFields[k] !== 'boolean') v.docFields[k] = d.docFields[k];
     if (typeof v.mmrLambda !== 'number') v.mmrLambda = d.mmrLambda;
+    // r7(§F5) 신규 필드 back-fill — 기본값=현행 동작이라 기존 전략 결과 불변.
+    if (v.hybridFusion !== 'weighted' && v.hybridFusion !== 'rrf') v.hybridFusion = d.hybridFusion;
+    if (!v.multiQuery || typeof v.multiQuery !== 'object') v.multiQuery = { ...d.multiQuery };
+    else {
+      if (typeof v.multiQuery.on !== 'boolean') v.multiQuery.on = d.multiQuery.on;
+      if (v.multiQuery.mode !== 'heuristic' && v.multiQuery.mode !== 'llm') v.multiQuery.mode = d.multiQuery.mode;
+      if (typeof v.multiQuery.perK !== 'number') v.multiQuery.perK = d.multiQuery.perK;
+    }
     return v;
   }
   function backfillGraphCfg(g) {
     if (!g) return g;
     const d = defaultGraphCfg();
+    // r7: beamWidth 신규 기본은 10(defaultGraphCfg=신규 전략 전용). 기존 전략은 구 기본 6으로 back-fill해
+    // 저장돼 있던(암묵 포함) 동작을 그대로 유지한다(스펙: "신규 전략에만 적용, back-fill은 기존값 유지").
+    const LEGACY_BEAM_WIDTH = 6;
     if (typeof g.maxDegree !== 'number') g.maxDegree = d.maxDegree;
     if (typeof g.hubNorm !== 'boolean') g.hubNorm = d.hubNorm;
-    if (!g.path || typeof g.path !== 'object') g.path = { ...d.path };
+    if (!g.path || typeof g.path !== 'object') g.path = { ...d.path, beamWidth: LEGACY_BEAM_WIDTH };
     else {
-      if (typeof g.path.beamWidth !== 'number') g.path.beamWidth = d.path.beamWidth;
+      if (typeof g.path.beamWidth !== 'number') g.path.beamWidth = LEGACY_BEAM_WIDTH;
       if (typeof g.path.maxLen !== 'number') g.path.maxLen = d.path.maxLen;
       if (!Array.isArray(g.path.edges) || !g.path.edges.length) g.path.edges = [...d.path.edges];
     }
+    // r7(§F5) 신규 필드 back-fill — 기본값=현행 엔진 상수라 기존 전략 결과 불변.
+    if (!g.multiSeed || typeof g.multiSeed !== 'object') g.multiSeed = { ...d.multiSeed };
+    else {
+      if (typeof g.multiSeed.on !== 'boolean') g.multiSeed.on = d.multiSeed.on;
+      if (g.multiSeed.mode !== 'heuristic' && g.multiSeed.mode !== 'llm') g.multiSeed.mode = d.multiSeed.mode;
+    }
+    if (typeof g.relBonus !== 'number') g.relBonus = d.relBonus;
+    if (typeof g.relevanceK !== 'number') g.relevanceK = d.relevanceK;
+    if (typeof g.includeRelTopN !== 'number') g.includeRelTopN = d.includeRelTopN;
     return g;
+  }
+
+  // r6: 프롬프트 전략 카탈로그 구성 기본값 — 기본 fields는 기존 buildToolCatalog 출력과 완전 동일(회귀 0).
+  // r7(§F5-4): 엔진과 동일한 DEFAULT_CATALOG_FIELDS를 단일 참조(값 중복 정의 제거).
+  function defaultCatalogCfg() {
+    return { fields: { ...DEFAULT_CATALOG_FIELDS }, autoFit: true };
+  }
+  // r6 하위호환 back-fill — catalog 필드 없는 기존·가져온 프롬프트 전략을 기본값으로 보강(기존 값 보존).
+  function backfillCatalogCfg(cfg) {
+    const d = defaultCatalogCfg();
+    if (!cfg.catalog || typeof cfg.catalog !== 'object') cfg.catalog = d;
+    else {
+      const c = cfg.catalog;
+      if (!c.fields || typeof c.fields !== 'object') c.fields = { ...d.fields };
+      else for (const k in d.fields) if (typeof c.fields[k] !== 'boolean') c.fields[k] = d.fields[k];
+      if (typeof c.autoFit !== 'boolean') c.autoFit = d.autoFit;
+    }
+    return cfg.catalog;
   }
 
   function defaultConfig(type) {
@@ -382,17 +434,20 @@ export async function render(container, ctx) {
   /* ---------- prompt 편집기 ---------- */
   function promptEditor(draft) {
     const cfg = draft.config;
+    // r6: 카탈로그 공급 섹션을 먼저 만들어 두고, planningMode 변경 시 예상 토큰을 재계산한다(예산이 plan/react별로 다름).
+    const catalogSec = catalogSection(cfg);
     const modeHint = el('div', { class: 'hint' }, MODE_HINT[cfg.planningMode || 'plan']);
     const modeSeg = segmented(
       [{ value: 'plan', label: '플랜 우선' }, { value: 'react', label: 'ReAct' }],
       cfg.planningMode || 'plan',
-      (v) => { cfg.planningMode = v; modeHint.textContent = MODE_HINT[v]; });
+      (v) => { cfg.planningMode = v; modeHint.textContent = MODE_HINT[v]; catalogSec.refreshCatalogEstimate?.(); });
 
     const tempVal = el('span', { class: 'mono', style: { minWidth: '34px' } }, String(cfg.temperature ?? 0.2));
     const tempInput = el('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(cfg.temperature ?? 0.2) });
     tempInput.addEventListener('input', () => { cfg.temperature = Number(tempInput.value); tempVal.textContent = tempInput.value; });
 
-    const stepsInput = numStepper(cfg.maxSteps ?? 6, 1, 20, (v) => { cfg.maxSteps = v; }); // clamp+동기화 통일(U2)
+    // r7: react 예산이 maxSteps에 비례(catalogBudgetTokens 3번째 인자)하므로 변경 시 예상 토큰도 갱신.
+    const stepsInput = numStepper(cfg.maxSteps ?? 6, 1, 20, (v) => { cfg.maxSteps = v; catalogSec.refreshCatalogEstimate?.(); }); // clamp+동기화 통일(U2)
 
     const ta = el('textarea', { class: 'input mono-input', spellcheck: 'false', style: { minHeight: '280px', lineHeight: '1.75' } });
     ta.value = cfg.systemPrompt || '';
@@ -408,9 +463,48 @@ export async function render(container, ctx) {
       },
     }, '기본 프롬프트로 재설정');
 
-    const catalogPreview = el('details', { style: { marginTop: '4px' } },
-      el('summary', { class: 'hint' }, '현재 도구 카탈로그 미리보기 ({{TOOL_CATALOG}} 치환 값)'),
-      el('pre', { class: 'catalog-pre' }, buildToolCatalog(mcps)));
+    /* r7(§F5-1): 카탈로그 미리보기 — 실제 실행과 동일하게 저장된 catalog 구성(fields)·autoFit·numCtx 예산을
+       반영해 생성한다(autoFit on → buildToolCatalogFitted, off → buildToolCatalog(fields)).
+       생성 비용이 있어 details를 펼치는 시점에 지연 생성하고, 구성 변경 시에는 stale 마킹만 해 두었다가
+       펼쳐져 있을 때만 즉시 재생성한다. catalogMode='retrieval'이면 실제 주입은 검색 결과이므로
+       "참고용 전체 카탈로그(기본 구성)" 라벨로 표시한다. */
+    const previewSummary = el('summary', { class: 'hint' }, '현재 도구 카탈로그 미리보기 ({{TOOL_CATALOG}} 치환 값)');
+    const previewMeta = el('div', { class: 'hint', style: { margin: '4px 0 0' } });
+    const previewPre = el('pre', { class: 'catalog-pre' }, '');
+    const catalogPreview = el('details', { style: { marginTop: '4px' } }, previewSummary, previewMeta, previewPre);
+    let previewStale = true;
+    function renderCatalogPreview() {
+      previewStale = false;
+      try {
+        if (cfg.catalogMode === 'retrieval') {
+          previewSummary.textContent = '참고용 전체 카탈로그(기본 구성) — 실제로는 검색된 도구만 주입됩니다';
+          previewMeta.textContent = '';
+          previewPre.textContent = buildToolCatalog(mcps);
+          return;
+        }
+        previewSummary.textContent = '현재 도구 카탈로그 미리보기 ({{TOOL_CATALOG}} 치환 값)';
+        const cat = cfg.catalog || defaultCatalogCfg();
+        if (cat.autoFit !== false) {
+          const mode = cfg.planningMode === 'react' ? 'react' : 'plan';
+          const budget = catalogBudgetTokens(getNumCtx(), mode, cfg.maxSteps);
+          const fit = buildToolCatalogFitted(mcps, budget, cat.fields);
+          previewMeta.textContent = fit.level > 0
+            ? `자동 축약 L${fit.level} 적용 — ≈${Math.round(fit.estTokens).toLocaleString('ko-KR')} tok (예산 ≈${Math.round(budget).toLocaleString('ko-KR')} tok, ${mode})`
+            : '';
+          previewPre.textContent = fit.text;
+        } else {
+          previewMeta.textContent = '';
+          previewPre.textContent = buildToolCatalog(mcps, cat.fields);
+        }
+      } catch (e) {
+        previewMeta.textContent = '';
+        previewPre.textContent = '(미리보기 생성 실패: ' + (e?.message || e) + ')';
+      }
+    }
+    function markPreviewStale() { previewStale = true; if (catalogPreview.open) renderCatalogPreview(); }
+    catalogPreview.addEventListener('toggle', () => { if (catalogPreview.open && previewStale) renderCatalogPreview(); });
+    // catalogSection의 구성 변경(모드·fields·autoFit·planningMode 등)을 미리보기에 전파.
+    catalogSec.onCatalogChange = markPreviewStale;
 
     return el('div', { class: 'stack' },
       field({ label: '플래닝 모드', input: el('div', { class: 'stack' }, modeSeg, modeHint) }),
@@ -424,14 +518,16 @@ export async function render(container, ctx) {
           el('div', { class: 'row' }, resetBtn),
           catalogPreview),
       }),
-      catalogSection(cfg));
+      catalogSec);
   }
 
   /* ---------- 도구 카탈로그 공급 (전체 / 검색 기반 RAG) ---------- */
   function catalogSection(cfg) {
+    ensureDbUiExtStyles(); // r6: .cat-est(예상 토큰 표시) 확장 스타일 주입(1회)
     if (cfg.catalogMode !== 'retrieval') cfg.catalogMode = 'full';
     if (!cfg.retrieval) cfg.retrieval = { method: 'hybrid', topK: 8, threshold: 0, hybridAlpha: 0.5, expandServer: true, expandCategory: false, embedModel: 'bge-m3:latest' };
     const r = cfg.retrieval;
+    const cat = backfillCatalogCfg(cfg); // r6: catalog.fields/autoFit 기본값 보장(기존 전략 back-fill — 동작 동일)
 
     // 하이브리드 α 슬라이더 (하이브리드에서만 표시)
     const alphaLabel = (a) => `${Number(a).toFixed(2)} (벡터)`;
@@ -536,16 +632,98 @@ export async function render(container, ctx) {
       el('div', { class: 'panel-title', style: { marginTop: '4px' } }, '인덱스 상태'),
       statusBox);
 
+    /* r6: 전체 제공(full) 전용 — 카탈로그 구성(fields) + 자동 축약(autoFit) + 예상 토큰/예산/예상 레벨 표시.
+       catalogMode='retrieval'이면 이 그룹은 숨긴다(검색 축소 카탈로그는 fields 미적용). */
+    const CAT_FIELD_DEFS = [
+      ['desc', '설명 (desc)', '서버·도구 설명 텍스트'],
+      ['params', '입력 파라미터 (params)', '입력 파라미터 이름·타입·필수·허용값'],
+      ['outputs', '출력 스키마 (outputs)', '도구별 출력 스키마 키 (→ 출력: …)'],
+      ['examples', '예시값 (examples)', '파라미터 예시값 (=예:…)'],
+    ];
+    const estBox = el('div', { class: 'cat-est' });
+    // r7(§F5-1): 구성 변경을 promptEditor의 카탈로그 미리보기에 전파하는 훅.
+    // root(반환 엘리먼트)의 onCatalogChange 프로퍼티로 노출 — root 생성 전 초기 호출은 no-op.
+    let rootEl = null;
+    const notifyCatalogChange = () => { rootEl?.onCatalogChange?.(); };
+    function refreshEstimate() {
+      // r7(§F5-4): 정적 import라 typeof 가드는 무의미 → 제거(부재 시 모듈 로드 자체가 실패).
+      try {
+        const est = estimateCatalogTokens(mcps, cat.fields);
+        const mode = cfg.planningMode === 'react' ? 'react' : 'plan';
+        // r7: catalogBudgetTokens 3번째 인자 maxSteps(계약) — react 예산이 maxSteps에 비례.
+        const budget = catalogBudgetTokens(getNumCtx(), mode, cfg.maxSteps);
+        const tok = (n) => Math.round(n).toLocaleString('ko-KR');
+        // r7(§F5-4): 예산에 플래닝 모드(plan|react) 병기 — 모드별 예산 차이를 드러낸다.
+        const rows = [el('span', { class: 'mono' }, `예상 카탈로그 ≈${tok(est)} tok / 예산 ≈${tok(budget)} tok (${mode})`)];
+        if (Number.isFinite(est) && Number.isFinite(budget) && est > budget) {
+          if (cat.autoFit !== false) {
+            const level = buildToolCatalogFitted(mcps, budget, cat.fields).level;
+            rows.push(el('span', { class: 'cat-est-fit' }, `→ 자동 축약 예상 레벨 L${level} (서버·도구 유지, 상세도 하향)`));
+          } else {
+            rows.push(el('span', { class: 'cat-est-over' }, '⚠ 초과 — 자동 축약이 꺼져 있어 프롬프트가 잘릴 수 있습니다'));
+          }
+        } else {
+          rows.push(el('span', { class: 'cat-est-ok' }, '예산 이내 — 전체 상세(L0)로 주입'));
+        }
+        estBox.replaceChildren(...rows);
+        estBox.style.display = '';
+      } catch { estBox.style.display = 'none'; }
+      notifyCatalogChange();
+    }
+    const fieldChkEls = {};
+    const fieldChecks = el('div', { class: 'row wrap', style: { gap: '14px' } },
+      ...CAT_FIELD_DEFS.map(([key, label, tip]) => {
+        const chk = el('input', { type: 'checkbox', checked: !!cat.fields[key] });
+        fieldChkEls[key] = chk;
+        chk.addEventListener('change', () => { cat.fields[key] = chk.checked; if (key === 'params') syncExamplesChk(); refreshEstimate(); });
+        return el('label', { class: 'chk-row', title: tip }, chk, el('span', {}, label));
+      }));
+    // r7(§F5-4): 예시값(examples)은 파라미터 줄에 붙는 표기(=예:…)라 params가 꺼지면 출력에 나타나지 않는다
+    // → params off 시 disabled + 사유 툴팁(값 자체는 보존 — params를 다시 켜면 그대로 복원).
+    function syncExamplesChk() {
+      const off = !cat.fields.params;
+      const ex = fieldChkEls.examples;
+      if (!ex) return;
+      ex.disabled = off;
+      const lbl = ex.closest('label');
+      if (lbl) {
+        lbl.title = off
+          ? '예시값은 입력 파라미터(params) 줄에 붙어 출력됩니다 — params를 먼저 켜세요.'
+          : (CAT_FIELD_DEFS.find(d => d[0] === 'examples')?.[2] || '');
+        lbl.style.opacity = off ? '0.55' : '';
+      }
+    }
+    syncExamplesChk();
+    const autoFitChk = el('input', { type: 'checkbox', checked: cat.autoFit !== false });
+    autoFitChk.addEventListener('change', () => { cat.autoFit = autoFitChk.checked; refreshEstimate(); });
+    const autoFitRow = el('label', { class: 'chk-row' }, autoFitChk,
+      el('span', {}, '자동 축약 — numCtx 예산 초과 시 상세도 단계 하향(L1~L4, 서버·도구는 유지)'));
+    const fullBody = el('div', { class: 'stack', style: { display: cfg.catalogMode === 'full' ? '' : 'none', marginTop: '2px' } },
+      field({ label: '카탈로그 구성 (catalog.fields)', input: fieldChecks, hint: '{{TOOL_CATALOG}}에 포함할 요소. 기본: 설명+입력 파라미터(기존과 동일) · vector db의 임베딩 문서 구성(docFields)과 대응되는 개념' }),
+      field({ label: '자동 축약 (catalog.autoFit)', input: autoFitRow, hint: '끄면 초과분이 그대로 주입되어 잘릴 수 있습니다(실행 시 ctxOverflow로 감지).' }),
+      estBox);
+    refreshEstimate();
+
     const modeSeg = segmented(
       [{ value: 'full', label: '전체 제공' }, { value: 'retrieval', label: '검색 기반 (RAG)' }],
       cfg.catalogMode || 'full',
-      (v) => { cfg.catalogMode = v; formBody.style.display = (v === 'retrieval') ? '' : 'none'; });
+      (v) => {
+        cfg.catalogMode = v;
+        formBody.style.display = (v === 'retrieval') ? '' : 'none';
+        fullBody.style.display = (v === 'full') ? '' : 'none'; // r6: 카탈로그 구성 그룹은 full 전용
+        if (v === 'full') refreshEstimate(); // refreshEstimate가 미리보기 갱신 알림까지 수행
+        else notifyCatalogChange(); // r7: retrieval 전환도 미리보기 라벨("참고용 …")에 반영
+      });
 
-    return el('div', { class: 'stack catalog-section' },
+    const root = el('div', { class: 'stack catalog-section' },
       el('div', { style: { height: '1px', background: 'var(--line-soft)', margin: '6px 0 2px' } }),
       el('div', { class: 'panel-title' }, '도구 카탈로그 공급'),
       field({ input: modeSeg, hint: '전체 제공: 모든 도구를 프롬프트에 나열 · 검색 기반: 질의와 관련된 도구만 검색해 공급(컨텍스트 절약)' }),
+      fullBody,
       formBody);
+    rootEl = root; // r7: notifyCatalogChange가 root.onCatalogChange 훅을 찾을 수 있게 연결
+    root.refreshCatalogEstimate = refreshEstimate; // r6: planningMode 변경 시 promptEditor가 호출(예산이 모드별로 다름)
+    return root;
   }
 
   /* ---------- skill 편집기 ---------- */
@@ -763,12 +941,43 @@ export async function render(container, ctx) {
     const alphaInput = el('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(r.hybridAlpha ?? 0.5) });
     alphaInput.addEventListener('input', () => { r.hybridAlpha = Number(alphaInput.value); alphaVal.textContent = alphaLabel(r.hybridAlpha); });
     const alphaWrap = field({ label: '하이브리드 가중 (α = 벡터 비중)', input: el('div', { class: 'row' }, alphaInput, alphaVal), hint: 'α=1 벡터 전용 · α=0 키워드 전용 · 두 점수 각각 정규화 후 가중합' });
-    alphaWrap.style.display = (r.method === 'hybrid') ? '' : 'none';
+
+    // r7(§F5-2): hybrid 융합 방식 — weighted(현행 α 가중합) | rrf(순위 역수 융합). hybrid에서만 표시,
+    // RRF 선택 시 α는 사용되지 않으므로 α 슬라이더는 숨긴다.
+    const fusionSeg = segmented(
+      [{ value: 'weighted', label: '가중 결합' }, { value: 'rrf', label: 'RRF' }],
+      r.hybridFusion === 'rrf' ? 'rrf' : 'weighted',
+      (v) => { r.hybridFusion = v; syncHybridVis(); });
+    const fusionWrap = field({
+      label: '하이브리드 융합 (hybridFusion)', input: fusionSeg,
+      hint: '가중 결합: 정규화 점수의 α 가중합(현행 기본) · RRF: 벡터·키워드 순위 역수 융합(Σ 1/(60+rank)) — 점수 스케일 차이에 둔감 · α는 순위 융합에 미사용 — 점수 임계값(threshold) 게이트에는 종전 가중합 사용',
+    });
+    function syncHybridVis() {
+      const hy = r.method === 'hybrid';
+      fusionWrap.style.display = hy ? '' : 'none';
+      alphaWrap.style.display = (hy && r.hybridFusion !== 'rrf') ? '' : 'none';
+    }
+    syncHybridVis();
 
     const methodSeg = segmented(
       [{ value: 'vector', label: '벡터' }, { value: 'keyword', label: '키워드' }, { value: 'hybrid', label: '하이브리드' }],
       r.method || 'hybrid',
-      (v) => { r.method = v; alphaWrap.style.display = (v === 'hybrid') ? '' : 'none'; });
+      (v) => { r.method = v; syncHybridVis(); });
+
+    // r7(§F5-2): 멀티 질의 분해 — 복합 질의를 부질의 2~5개로 분해해 각각 검색 후 라운드로빈 병합(retrieveMulti).
+    const mq = r.multiQuery;
+    const mqModeSeg = segmented(
+      [{ value: 'heuristic', label: '휴리스틱' }, { value: 'llm', label: 'LLM' }],
+      mq.mode === 'llm' ? 'llm' : 'heuristic', (v) => { mq.mode = v; });
+    const mqPerK = numStepper(mq.perK ?? 4, 1, 8, (v) => { mq.perK = v; }, '90px');
+    const mqDetail = el('div', { class: 'row wrap', style: { gap: '14px', alignItems: 'center', display: mq.on ? '' : 'none' } },
+      el('div', { class: 'row', style: { gap: '6px' } }, el('span', { class: 'hint' }, '분해 방식'), mqModeSeg),
+      el('div', { class: 'row', style: { gap: '6px' } }, el('span', { class: 'hint' }, '부질의당 K (perK)'), mqPerK));
+    const mqChk = el('input', { type: 'checkbox', checked: !!mq.on });
+    mqChk.addEventListener('change', () => { mq.on = mqChk.checked; mqDetail.style.display = mq.on ? '' : 'none'; });
+    const mqGroup = el('div', { class: 'stack', style: { gap: '6px' } },
+      el('label', { class: 'chk-row' }, mqChk, el('span', {}, '멀티 질의 분해 사용 (multiQuery)')),
+      mqDetail);
 
     const topKInput = el('input', { class: 'input', type: 'number', min: '1', max: '30', value: String(r.topK ?? 8), style: { maxWidth: '120px' } });
     const clampTopK = (n) => Math.min(30, Math.max(1, Number.isFinite(n) ? n : 8));
@@ -799,8 +1008,8 @@ export async function render(container, ctx) {
     const DOC_FIELD_DEFS = [
       ['desc', '설명 (desc)', '도구·서버 설명 텍스트'],
       ['params', '입력 파라미터 (params)', '입력 파라미터 이름·설명'],
-      ['outputs', '출력 스키마 (outputs)', '출력 스키마 키·설명'],
-      ['examples', '예시 (examples)', 'examples·mock 샘플 값'],
+      ['outputs', '출력 스키마 (outputs)', '출력 스키마 키·설명 — "A의 출력→B의 입력" 워크플로 체인 검색 강화에 권장'],
+      ['examples', '예시값 (examples)', 'examples·mock 샘플 값'],
       ['tags', '태그 (tags)', '서버 tags'],
     ];
     const docFieldsWarn = el('div', { class: 'idx-warn', style: { display: 'none', marginTop: '6px' } },
@@ -883,11 +1092,15 @@ export async function render(container, ctx) {
       el('div', { class: 'grid cols-2' },
         field({ label: '상위 K (topK)', input: topKInput, hint: '검색으로 공급할 도구 수 (1~30)' }),
         field({ label: '임베딩 모델 (embedModel)', input: embedI, hint: '인덱스 구축·벡터/하이브리드 질의에 사용' })),
-      field({ label: '점수 임계값 (threshold)', input: el('div', { class: 'row' }, thInput, thVal), hint: '이 점수 미만 도구 제외 · 벡터=코사인, 하이브리드=정규화 0~1' }),
+      // r7(§F5-2): keyword는 BM25 원점수(0~1 스케일 아님)라 이 슬라이더 범위로는 사실상 걸러지지 않음을 명시.
+      field({ label: '점수 임계값 (threshold)', input: el('div', { class: 'row' }, thInput, thVal), hint: '이 점수 미만 도구 제외 · 벡터=코사인, 하이브리드=정규화 0~1 · 키워드=BM25 원점수(보통 1 이상)라 0~1 임계값으로는 거의 걸러지지 않음' }),
       alphaWrap,
+      fusionWrap,
+      field({ label: '멀티 질의 분해 (multiQuery)', input: mqGroup, hint: '여러 분야를 오가는 복합 질의에서 정답 도구 누락(검색 리콜↓)을 줄일 때 사용 · 복합 질의를 부질의 2~5개로 분해해 각각 검색(부질의당 perK개) 후 순위 교차(라운드로빈) 병합 → topK 절단(topK ≥ 부질의 수 권장 — 작으면 부질의 결과가 잘려나감) · 휴리스틱: 문장·연결어미 분리(LLM 호출 없음) · LLM: 1회 호출로 분해(문항당 LLM 호출 +1, 실패 시 원질의 폴백)' }),
       field({ label: '이웃 확장', input: checks, hint: '검색된 도구의 서버/카테고리 이웃 도구를 함께 공급합니다.' }),
       field({ label: '임베딩 문서 구성 (docFields)', input: docFieldsGroup, hint: '인덱싱 시 각 도구 문서에 포함할 요소. 기본: 설명+입력 파라미터. 변경하면 인덱스를 재구축해야 반영됩니다.' }),
-      field({ label: 'MMR 다양성 (λ)', input: el('div', { class: 'row' }, mmrInput, mmrVal), hint: 'λ=1 관련도만(MMR off·현행) · λ=0 다양성 최대 · 검색 시점 재정렬이라 재색인 불필요' }),
+      // r7(§F5-2): MMR 무력화 조건(문서 벡터 필요 — 키워드 검색·인덱스 미구축 시 효과 없음) 힌트.
+      field({ label: 'MMR 다양성 (λ)', input: el('div', { class: 'row' }, mmrInput, mmrVal), hint: 'λ=1 관련도만(MMR off·현행) · λ=0 다양성 최대 · 검색 시점 재정렬이라 재색인 불필요 · 문서 벡터를 사용하므로 키워드 검색·인덱스 미구축(폴백) 상태에서는 효과가 없습니다' }),
       el('div', { class: 'panel-title', style: { marginTop: '4px' } }, '벡터 인덱스 상태'),
       statusBox);
   }
@@ -1325,9 +1538,47 @@ export async function render(container, ctx) {
     const maxDegInput = numInput(g.maxDegree ?? 12, 4, 30, (v) => { g.maxDegree = v; scheduleRedraw(); });
     const hubChk = el('input', { type: 'checkbox', checked: g.hubNorm !== false });
     hubChk.addEventListener('change', () => { g.hubNorm = hubChk.checked; scheduleRedraw(); });
-    // 경로 추천: 빔 폭·최대 길이(런타임 파라미터, 재구축 불필요).
-    const beamInput = numInput(g.path.beamWidth ?? 6, 1, 20, (v) => g.path.beamWidth = v);
+    // 경로 추천: 빔 폭·최대 길이(런타임 파라미터, 재구축 불필요). 빔 폭 기본 10(r7 — 기존 전략은 back-fill로 6 유지).
+    const beamInput = numInput(g.path.beamWidth ?? 10, 1, 20, (v) => g.path.beamWidth = v);
     const pathLenInput = numInput(g.path.maxLen ?? 4, 2, 6, (v) => g.path.maxLen = v);
+
+    /* --- r7(§F5-3): 멀티 시드 분해 + relevance 블렌드(고급) --- */
+    // multiSeed: 실행 시 복합 질의를 부질의로 분해해 부질의별 시드를 찾고 relevance는 노드별 max로 병합
+    // (graphRetrieve의 queries 옵션 — 분해는 orchestrator가 수행). 확산·정렬은 기존과 동일.
+    const ms = g.multiSeed;
+    const msModeSeg = segmented(
+      [{ value: 'heuristic', label: '휴리스틱' }, { value: 'llm', label: 'LLM' }],
+      ms.mode === 'llm' ? 'llm' : 'heuristic', (v) => { ms.mode = v; });
+    const msDetail = el('div', { class: 'row', style: { gap: '6px', alignItems: 'center', display: ms.on ? '' : 'none' } },
+      el('span', { class: 'hint' }, '분해 방식'), msModeSeg);
+    // r8(§H4-7): multiSeed on일 때만 검색 미리보기 하단에 표시 — 분해는 실행(orchestrator) 경로에서만 수행됨을 안내
+    const msPreviewHint = el('div', { class: 'hint', style: { display: ms.on ? '' : 'none' } },
+      'ⓘ 멀티 시드 분해는 실행 시에만 적용 — 미리보기는 원질의 1개로 검색합니다.');
+    const msChk = el('input', { type: 'checkbox', checked: !!ms.on });
+    msChk.addEventListener('change', () => {
+      ms.on = msChk.checked;
+      msDetail.style.display = ms.on ? '' : 'none';
+      msPreviewHint.style.display = ms.on ? '' : 'none';
+    });
+    const msGroup = el('div', { class: 'stack', style: { gap: '6px' } },
+      el('label', { class: 'chk-row' }, msChk, el('span', {}, '멀티 시드 분해 사용 (multiSeed)')),
+      msDetail);
+    // relevance 블렌드 파라미터 — 기본값은 엔진 현행 상수(relBonus 0.5 / relevanceK 15 / includeRelTopN 0)와 동일.
+    const relBonusVal = el('span', { class: 'mono', style: { minWidth: '34px' } }, Number(g.relBonus ?? 0.5).toFixed(1));
+    const relBonusInput = el('input', { type: 'range', min: '0', max: '2', step: '0.1', value: String(g.relBonus ?? 0.5) });
+    relBonusInput.addEventListener('input', () => { g.relBonus = Number(relBonusInput.value); relBonusVal.textContent = g.relBonus.toFixed(1); });
+    const relKInput = numInput(g.relevanceK ?? 15, 5, 40, (v) => g.relevanceK = v);
+    // r8(§H4-7): includeRelTopN 새 의미 — "시드(seedK) 제외 관련도 상위 N" 편입. 엔진 유효 상한이
+    // relevanceK−seedK이므로 UI 고정 상한을 39(=relevanceK 최대 40 − seedK 최소 1)로 확대(엔진 계약과 일치 —
+    // 상한 초과분은 엔진이 min(N, relevanceK−seedK)로 클램프).
+    const incRelInput = numInput(g.includeRelTopN ?? 0, 0, 39, (v) => g.includeRelTopN = v);
+    const advGroup = el('details', { style: { marginTop: '4px' } },
+      el('summary', { class: 'accordion-sum' }, '고급 — 멀티 시드 분해 · relevance 블렌드'),
+      el('div', { class: 'grid cols-2', style: { marginTop: '10px' } },
+        field({ label: '멀티 시드 분해 (multiSeed)', input: msGroup, hint: '여러 분야를 오가는 복합 질의에서 정답 도구 누락(검색 리콜↓)을 줄일 때 사용 · 복합 질의를 부질의로 분해해 부질의별 시드 검색 후 시드 라운드로빈 병합(각 부질의 1위부터 교차)·relevance max-병합 · 휴리스틱: 문장·연결어미 분리(LLM 호출 없음) · LLM: 1회 호출로 분해(문항당 LLM 호출 +1, 실패 시 원질의 폴백)' }),
+        field({ label: 'relevance 블렌드 (relBonus)', input: el('div', { class: 'row' }, relBonusInput, relBonusVal), hint: '그래프 도달(비시드) 노드 점수에 질의 관련도를 더하는 비중 0~2 · 기본 0.5(현행)' }),
+        field({ label: 'relevance 후보 수 (relevanceK)', input: relKInput, hint: '시드보다 넓게 확보할 질의 관련도 후보 수 5~40 · 기본 15(현행)' }),
+        field({ label: 'relevance 상위 편입 (includeRelTopN)', input: incRelInput, hint: '시드 제외 관련도 상위 N 편입(0=끔, 유효 상한은 relevanceK−seedK) · N>0이면 시드로 이미 뽑힌 것을 제외한 관련도 상위 N개를 그래프 비도달이어도 후보에 편입(점수 rel×relBonus)' })));
     // 사용 엣지 세그먼트(io / io+llm) — 자체 제어. io+llm은 llm 엣지가 켜져 있을 때만 활성.
     const pathEdgesSeg = el('div', { class: 'seg', role: 'tablist' });
     function renderPathEdgesSeg() {
@@ -1429,6 +1680,8 @@ export async function render(container, ctx) {
       try {
         await graphMod.buildGraph({
           mcps, benchmarks, embedModel: g.embedModel || defaultEmbed,
+          // r7(§F5-3): 구축 시 semantic 후보 엣지의 저장 하한 — 현재 편집 중인 런타임 임계값을 그대로 사용한다.
+          // 런타임 threshold는 이 하한보다 "높게 조이는" 방향만 재구축 없이 유효(더 낮추려면 재구축 필요).
           buildSemanticThreshold: g.edges.semantic?.threshold ?? 0.55,
           includeLlm: llmOn, extractModel: g.extractModel || defaultExtract,
           signal: buildAbort.signal,
@@ -1515,6 +1768,9 @@ export async function render(container, ctx) {
           mcps, graph, edgeParams: g.edges, seedMethod: g.seedMethod, seedK: g.seedK,
           hops: g.hops, decay: g.decay, topK: g.topK, embedModel: g.embedModel,
           maxDegree: g.maxDegree, hubNorm: g.hubNorm, // §3: degree 상한·허브 정규화
+          // r7(§F5): 저장된 cfg의 relevance 블렌드 파라미터를 그대로 전달 — 실행 경로와 동일 조건 미리보기.
+          // multiSeed(queries) 분해는 orchestrator 실행 경로에서 수행하므로 미리보기는 원질의 1개로 조회한다.
+          relBonus: g.relBonus, relevanceK: g.relevanceK, includeRelTopN: g.includeRelTopN,
         });
         renderPreview(ret, graph);
       } catch (e) {
@@ -1554,8 +1810,9 @@ export async function render(container, ctx) {
         field({ label: '홉 수 (hops)', input: hopsInput, hint: '시드에서 몇 단계까지 확산할지 (1~4)' }),
         field({ label: '감쇠 (decay)', input: el('div', { class: 'row' }, decayInput, decayVal), hint: '홉이 멀수록 점수를 줄이는 비율 (0~1)' }),
         field({ label: '상위 K (topK)', input: topKInput, hint: '최종 공급할 도구 수 (1~30)' }),
-        field({ label: '노드 최대 연결 (maxDegree)', input: maxDegInput, hint: '노드별 최대 연결 수(io 출력 상한 포함) 4~30 · 축소는 즉시 반영, 확대는 재구축이 필요할 수 있음' }),
+        field({ label: '노드 최대 연결 (maxDegree)', input: maxDegInput, hint: '노드별 최대 연결 수(io 출력 상한 포함) 4~30 · 그래프는 상한 30으로 저장되어 있어 그 안에서는 재구축 없이 즉시 조절됩니다' }),
         field({ label: '허브 정규화 (hubNorm)', input: el('label', { class: 'chk-row' }, hubChk, el('span', {}, '허브 degree 정규화(1/√deg)')), hint: '연결이 많은 허브 노드의 확산 기여를 낮춰 결과 편중을 줄입니다.' })),
+      advGroup,
       el('div', { class: 'panel-title', style: { marginTop: '6px' } }, '경로 추천 (recommendPaths)'),
       el('div', { class: 'grid cols-2' },
         field({ label: '빔 폭 (beamWidth)', input: beamInput, hint: '경로 탐색 시 유지할 후보 경로 수 (1~20)' }),
@@ -1573,7 +1830,8 @@ export async function render(container, ctx) {
       el('div', { class: 'hint' }, '질의를 입력하면 graphRetrieve로 도구를 검색하고, 같은 질의로 recommendPaths 경로를 추천합니다. 시드/선택 노드는 위 그래프에서 강조됩니다.'),
       el('div', { class: 'row', style: { gap: '8px' } }, el('div', { class: 'grow' }, qInput), searchBtn),
       previewHost,
-      pathHost);
+      pathHost,
+      msPreviewHint); // r8(§H4-7): multiSeed on일 때만 표시(미리보기는 원질의 1개)
   }
 
   function buildTypeEditor(draft) {
@@ -1796,7 +2054,7 @@ const EDGE_DESC_FALLBACK = {
   llm: 'LLM이 추출한 도구 간 의미 관계(방향) 연결입니다.',
 };
 
-// v2 DB 편집기 확장 스타일 — main.css를 수정하지 않고 이 뷰에서 1회만 <style id="rbtl-dbui-ext">를 주입한다.
+// v2 DB·r6 프롬프트 편집기 확장 스타일 — main.css를 수정하지 않고 이 뷰에서 1회만 <style id="rbtl-dbui-ext">를 주입한다.
 // (이미 존재하면 재주입하지 않음). .graph-viz-wrap을 position:relative로 만들어 .gv-tip 오버레이의 기준으로 삼는다.
 function ensureDbUiExtStyles() {
   if (typeof document === 'undefined') return;
@@ -1817,6 +2075,15 @@ function ensureDbUiExtStyles() {
     '.gv-tip-tool { color: #aedcff; word-break: break-all; }',
     '.gv-tip-meta { color: #9fb0c8; font-size: 10.5px; }',
     '.seg button:disabled { opacity: 0.4; cursor: not-allowed; }',
+    /* r6: 프롬프트 편집기 카탈로그 구성 — 예상 토큰/예산/예상 축약 레벨 표시줄 */
+    '.cat-est {',
+    '  display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline;',
+    '  padding: 7px 10px; border: 1px solid var(--line-soft, rgba(150, 170, 200, 0.18));',
+    '  border-radius: 7px; background: rgba(150, 170, 200, 0.06); font-size: 12px;',
+    '}',
+    '.cat-est .cat-est-ok { color: var(--sig-green, #31d07c); }',
+    '.cat-est .cat-est-fit { color: var(--sig-blue, #4da3ff); }',
+    '.cat-est .cat-est-over { color: var(--sig-amber, #f4b63f); }',
   ].join('\n');
   document.head.appendChild(style);
 }

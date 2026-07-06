@@ -141,9 +141,10 @@ store.import(obj, { includeAccounts = false })
 }
 ```
 
-- `type:'prompt'` → `config = { systemPrompt: string, planningMode: 'plan'|'react', temperature: number, maxSteps: number }`
+- `type:'prompt'` → `config = { systemPrompt: string, planningMode: 'plan'|'react', temperature: number, maxSteps: number, catalog?: { fields: { desc, params, outputs, examples }, autoFit: boolean } }`
   - systemPrompt 안에서 플레이스홀더 `{{TOOL_CATALOG}}`, `{{QUERY}}`, `{{DATE}}` 사용 가능.
   - `plan`: 1회 호출로 전체 계획 JSON 수립 후 순차 실행. `react`: 단계마다 LLM 호출(관찰 포함) 반복.
+  - `catalog`(전체 카탈로그 주입 시 의미): fields로 카탈로그에 포함할 요소 선택(기본 desc+params — 기존 출력과 동일), autoFit(기본 true)은 예산 초과 시 자동 축약(L1~L4). 없으면 기본값으로 back-fill.
 - `type:'skill'` → `config = { skills: [{ id, name, trigger, description, steps: [Step] }], selectorPrompt: string, paramFill: 'llm'|'template' }`
   - Step: `{ serverId, toolName, paramsTemplate: object }` — paramsTemplate 값에 `{{QUERY}}`, `{{step1.output.xxx}}` 참조 가능.
   - 실행: LLM이 selectorPrompt+스킬 목록으로 스킬 1개 선택 → steps 순차 실행(파라미터는 paramFill 방식으로 채움).
@@ -151,8 +152,11 @@ store.import(obj, { includeAccounts = false })
   - LLM 없이 결정적으로 매칭(우선순위 오름차순 정렬 후 첫 매치). onNoMatch='llmFallback'이면 기본 플래너로 폴백.
 - `type:'db'` → `config = { store: 'vector'|'graph', planningMode: 'plan'|'react', temperature, maxSteps, systemPrompt, vector?: {...}, graph?: {...} }`
   - 실행 전 카탈로그를 db 검색으로 축소해 `{{TOOL_CATALOG}}`에 **질의 관련 도구만** 주입하고, 이후 prompt 전략과 동일한 plan/react 경로를 공유한다.
-  - `store:'vector'` → `vector = { method: 'vector'|'keyword'|'hybrid', topK, threshold, hybridAlpha, expandServer, expandCategory, embedModel }` (catalogIndex.js — 도구당 벡터 1개, MMR·docFields 등 상세는 SPEC-GRAPH.md).
-  - `store:'graph'` → `graph = { edges: { io|semantic|server|category|cooccur|llm: {on,weight,threshold?} }, seedMethod, seedK, hops, decay, topK, embedModel, extractModel }` (catalogGraph.js — 상세는 SPEC-GRAPH.md).
+  - `store:'vector'` → `vector = { method: 'vector'|'keyword'|'hybrid', topK, threshold, hybridAlpha, hybridFusion: 'weighted'|'rrf', multiQuery: { on: false, mode: 'heuristic'|'llm', perK: 4 }, expandServer, expandCategory, embedModel }` (catalogIndex.js — 도구당 벡터 1개, MMR·docFields 등 상세는 SPEC-GRAPH.md).
+    - `hybridFusion`(기본 'weighted'=현행): hybrid 점수 융합 방식 — 'rrf'는 순위 역수 융합(§7 검색 옵션 참조). `multiQuery`(기본 off): on이면 질의를 부질의로 분해해 `retrieveMulti`로 검색(멀티 질의 분해 — §7 실행 공통).
+  - `store:'graph'` → `graph = { edges: { io|semantic|server|category|cooccur|llm: {on,weight,threshold?} }, seedMethod, seedK, hops, decay, topK, maxDegree, hubNorm, embedModel, extractModel, multiSeed: { on: false, mode: 'heuristic'|'llm' }, relBonus: 0.5, relevanceK: 15, includeRelTopN: 0 }` (catalogGraph.js — 상세는 SPEC-GRAPH.md).
+    - `multiSeed`(기본 off): on이면 부질의별 시드를 **라운드로빈**(각 부질의 ranked 1위부터 교차)으로 선정하고, relevance는 노드별 max-병합 후 전역 정규화. `relBonus`(기본 0.5)·`relevanceK`(기본 15)·`includeRelTopN`(기본 0 — >0이면 **시드 제외** 관련도 상위 N 편입)은 그래프 확산 점수와 질의 관련도 블렌드 파라미터 — 기본값은 모두 현행 동작(§7 검색 옵션 참조).
+  - 신규 필드는 없으면 기본값으로 back-fill한다(하위호환 — 기본값=현행 동작, 회귀 0).
   - 인덱스/그래프 미구축·stale·검색 0건이면 keyword/vector/전체 카탈로그로 자동 폴백하며, 폴백 사유는 ExecutionResult의 `retrievalFallback`에 기록된다.
 
 ### BenchmarkSet / BenchmarkItem
@@ -190,6 +194,13 @@ BenchmarkItem {
   tokensEstimated: boolean,  // 하나라도 추정치가 섞이면 true
   ctxOverflow: boolean,      // 기본 false — 프롬프트 전체 추정(chars/2.2) > numCtx 또는 실측 promptTokens ≥ numCtx×0.98(절단 의심)
   retrievalFallback: string|null, // 기본 null — db 전략 검색 폴백 사유(예: 'graph→vector', 'vector→keyword(stale)', '검색 0건→전체 카탈로그')
+  catalogDetail: number,     // 기본 0 — 카탈로그 자동 축약 레벨(0=전체 상세[기존 동일], 1~4=예산에 맞춘 단계 축약. 서버·도구는 전부 유지)
+  retrievedTools: string[]|null,  // 기본 null — db 전략 검색 성공 시 플래너에 공급된 최종 후보 도구 키('serverId/toolName') 배열.
+                                  //   전체 카탈로그 주입 경로·전체 카탈로그 폴백이면 null.
+                                  //   확정 시점: 검색 직후가 아니라 {{TOOL_CATALOG}}가 실제 치환될 때(미치환=커스텀 프롬프트에
+                                  //   플레이스홀더 없음이면 null 유지 — 허위 기록 방지)
+  suppliedToolCount: number|null, // 실제 플래너에 공급된 도구 수 — 검색 축소 시 최종 후보 수, 전체 카탈로그 주입이면 전체 도구 수(mcps 기준).
+                                  //   확정 시점은 retrievedTools와 동일({{TOOL_CATALOG}} 실제 치환 시)
   totalLatencyMs: number, error?: string, finalAnswer?: string
 }
 ```
@@ -202,9 +213,18 @@ BenchmarkItem {
   model: string|null,        // 모델 오버라이드(공정 비교) 사용 시 기록
   temperature: number|null,  // 온도 통일 사용 시 기록
   maxSteps: number|null,     // maxSteps 통일 사용 시 기록
+  numCtx: number,            // 실행 시점 settings.numCtx 스냅샷(run 재현성) — numCtx가 다른 run 간에는 ctx/축약/폴백류 지표 비교 불가
+  toolCount: number,         // 실행 시점 전체 도구 수(mcps 기준) — run 재현 보조. 카탈로그 규모가 다른 run 간에는 검색·축약류 지표 비교 불가
   perStrategy: {
     [strategyId]: {
       strategyName, strategyType,
+      configSnapshot,        // 실행 시점 전략 구성 슬림 스냅샷(run 재현성 — 유효 전략(오버라이드 반영) 기준, 존재 필드만, 깊은 복사):
+                             //   { type, planningMode, catalogMode, catalog{fields,autoFit}, store,
+                             //     vector{method,topK,threshold,hybridAlpha,mmrLambda,docFields,expandServer,expandCategory,hybridFusion,multiQuery,embedModel},
+                             //     graph{edges 요약(on/weight/threshold), seedMethod,seedK,hops,decay,topK,maxDegree,hubNorm,path,
+                             //           relBonus,relevanceK,includeRelTopN,multiSeed,embedModel,extractModel},
+                             //     paramFill(skill), onNoMatch(rule), maxSteps, temperature,
+                             //     model(해석값 — effStrategy.model ?? getDefaultModel(), 항상 채워짐) }
       items: [{ itemId, query, difficulty, category, expected, actual: steps(절단),
                 metrics: ItemMetrics, error?, hasStepErrors, usedFallback,
                 latencyMs, llmCalls, trace(절단), finalAnswer? }],
@@ -222,7 +242,17 @@ ItemMetrics {
                                      //   (null 지표는 가중치 제외 후 재정규화)
   inputTokens, outputTokens, totalTokens, tokensEstimated: boolean, // 토큰 계측(runEvaluation이 병합)
   ctxOverflow: boolean,              // 프롬프트 numCtx 초과(절단 의심) — 신뢰도 플래그
-  retrievalFallback: string|null     // db 검색 폴백 사유 — 신뢰도 플래그
+  retrievalFallback: string|null,    // db 검색 폴백 사유 — 신뢰도 플래그
+  catalogDetail: number,             // 카탈로그 자동 축약 레벨(0~4, 0=축약 없음) — ExecutionResult.catalogDetail 병합
+  retrievalRecall: number|null,      // 검색 리콜 — res.retrievedTools가 있을 때, gold 후보(primary+alternatives) 각각의
+                                     //   검색 후보 포함 비율 중 최대(최대 커버리지 — "완전한 정답 경로가 후보에 존재했는가"의
+                                     //   기회 상한, 채택 정답과 다를 수 있음). null = 전체 카탈로그 주입/검색 기록 없음(N/A).
+                                     //   [설계 결정] 채택-gold(F1 최대 후보) 기준은 기각 — 채택이 actual(플래너 출력)에 의존해
+                                     //   검색 지표가 플래너 성능에 오염되는 순환성 때문(검색 지표는 플래너와 독립이어야 함)
+  goalRetrieved: boolean|null,       // 목표 도구 검색 여부 — retrievedTools 기록 문항에서 goal 후보(item.goal 있으면 그것,
+                                     //   없으면 primary·각 alternative의 마지막 step들) 중 하나라도 후보에 포함되면 true.
+                                     //   null = retrievedTools 없음(N/A)
+  suppliedToolCount?: number|null    // (선택 보존) 플래너에 공급된 도구 수 — ExecutionResult.suppliedToolCount
 }
 SummaryMetrics {
   avgPrecision, avgRecall, avgF1, avgSeqAccuracy, exactMatchRate, avgParamScore: number|null,
@@ -235,6 +265,12 @@ SummaryMetrics {
   avgComposite,
   ctxOverflowCount: number,          // 컨텍스트 초과 문항 수(ctxOverflow=true)
   retrievalFallbackCount: number,    // 검색 폴백 문항 수(retrievalFallback≠null)
+  catalogCompressedCount: number,    // 카탈로그 자동 축약 문항 수(metrics.catalogDetail>0 — 서버 유지, 상세도 하향.
+                                     //   리더보드 "축약 L{n}×N" 뱃지의 N — catalogDetailMax 부재(구 run) 시 기존 "축약 N" 폴백)
+  avgRetrievalRecall: number|null,   // 검색 리콜 평균(retrievalRecall=null 문항 제외, 전부 null이면 null) — 리더보드 "검색 리콜" 열
+  retrievalMissCount: number,        // retrievalRecall < 1 문항 수(검색이 정답 도구를 하나라도 놓친 문항)
+  goalMissCount: number,             // 목표 도구 미검색 문항 수(goalRetrieved===false) — "검색 리콜" 열 title에 병기
+  catalogDetailMax: number,          // 문항 catalogDetail 최댓값(0~4) — 리더보드 "축약 L{n}×N" 뱃지의 레벨 n
   tokenEfficiency,           // finalizeScores 주입 — 가장 적은 평균총토큰/이 전략의 평균총토큰(run 내 상대, [0,1])
   orchestrationScore         // finalizeScores 주입 — 0.85·avgComposite + 0.15·tokenEfficiency
 }
@@ -282,9 +318,17 @@ export async function executeStrategy(strategy, query, opts)
 // opts: { mcps: McpServer[], onTrace?: (TraceEvent)=>void, signal?: AbortSignal }
 // 반환: ExecutionResult. 내부에서 타입별(prompt/skill/rule/db) 실행기 분기.
 // db 타입은 catalogIndex(vector)/catalogGraph(graph) 검색으로 카탈로그를 축소한 뒤 plan/react 경로를 공유.
-export function buildToolCatalog(mcps)   // LLM 프롬프트용 도구 카탈로그 텍스트(간결, 토큰 절약형)
-export function estimateCatalogTokens(mcps) // 전체 카탈로그 프롬프트의 추정 토큰 수(≈글자수/2.2, LLM 호출 없음)
+export function buildToolCatalog(mcps, fields?)   // LLM 프롬프트용 도구 카탈로그 텍스트(간결, 토큰 절약형) — fields={desc,params,outputs,examples}로 포함 요소 선택(미지정=기본 desc+params=기존 출력과 동일)
+export function estimateCatalogTokens(mcps, fields?) // 전체 카탈로그 프롬프트의 추정 토큰 수(≈글자수/2.2, LLM 호출 없음)
                                             // — 평가 화면 사전 점검(preflight)이 numCtx와 비교하는 데 사용
+export function catalogBudgetTokens(numCtx, planningMode, maxSteps?) // 카탈로그 컨텍스트 예산 = max(1500, numCtx − 차감)
+                                            // — plan 차감 2048(기존 유지). react 차감 = min(floor(numCtx/2), 1536 + 450×clamp(maxSteps||6, 1, 20))
+                                            //   (기본 maxSteps=6 → 차감 4236 ≈ 기존 4096 — 단계 수에 비례해 ReAct 히스토리 여유 확보)
+export function buildToolCatalogFitted(mcps, budgetTokens, fields?) // 예산에 맞는 최소 축약 레벨(0~4)로 카탈로그 생성 → { text, level, estTokens, fullEstTokens } — 예산 이내면 L0(기존 buildToolCatalog와 동일 출력), 결과 레벨은 ExecutionResult.catalogDetail에 기록
+export function usesFullCatalog(strategy)   // 전략의 유효 프롬프트 템플릿(커스텀 또는 기본)에 {{TOOL_CATALOG}}가 포함되어 전체 카탈로그가
+                                            // 주입될 수 있으면 true — prompt(full)=true, db(retrieval)=false(폴백 제외),
+                                            // skill=셀렉터 템플릿에 포함 시만, rule=onNoMatch:'llmFallback'이고 유효 폴백 템플릿에 포함 시만.
+                                            // 평가 화면 사전 점검(preflight)의 "전체 카탈로그 주입 전략" 분류 기준
 export const DEFAULT_PLANNER_PROMPT      // {{TOOL_CATALOG}} 등 포함 기본 시스템 프롬프트(한국어)
 ```
 실행 공통: 각 단계에서 mockEngine.executeTool 호출, trace 이벤트 방출, maxSteps 초과 시 중단.
@@ -292,6 +336,59 @@ LLM 응답 파싱 실패 시 1회 재요청("JSON만 출력") 후 실패 처리.
 토큰 계측: 각 LLM 호출의 promptTokens/outputTokens를 result.inputTokens/outputTokens에 합산(실측 없으면 추정 + tokensEstimated=true).
 신뢰도 플래그: 프롬프트 전체 추정(chars/2.2) > numCtx 또는 실측 promptTokens ≥ numCtx×0.98 시 `ctxOverflow=true`,
 db 검색이 폴백으로 실행되면 `retrievalFallback='<사유>'`(최초 1회) 기록 — evaluator가 item.metrics로 옮긴다.
+카탈로그 기록 정합: 카탈로그 fitted 계산은 최초 필요 시 1회 지연 수행하며, `catalogDetail`·축약 trace·'카탈로그 구성' trace는
+`{{TOOL_CATALOG}}`가 실제 치환되는 프롬프트가 실행될 때만 기록한다(rule 매치 성공·카탈로그 미포함 skill 셀렉터는 기록·계산 없음 —
+허위 축약 뱃지 방지. db/retrieval은 검색 성공 시 0/생략, 전체 카탈로그 폴백 시에만 fitted 사용·기록).
+검색 후보 기록: db 검색 성공 시 `retrievedTools`('serverId/toolName' 키 배열)·`suppliedToolCount`(플래너 공급 도구 수)를 기록하고,
+전체 카탈로그 주입 경로는 retrievedTools=null·suppliedToolCount=전체 도구 수. 두 값은 검색 직후 pending에 보관했다가
+`{{TOOL_CATALOG}}`가 실제 치환되는 프롬프트가 실행될 때 result에 확정한다(커스텀 프롬프트에 플레이스홀더가 없어
+미치환이면 null 유지 — 공급되지 않은 후보의 허위 기록 방지).
+멀티 질의 분해: db 전략에서 `vector.multiQuery.on`(→ retrieveMulti) / `graph.multiSeed.on`(→ graphRetrieve의 queries)이면
+질의를 부질의 2~5개로 분해해 검색한다 — heuristic: 문장(.?!·줄바꿈 — 단 숫자 사이 '.'는 분리하지 않음, 예: '규모 3.5') 및
+연결어미 절 분리('그리고/한 뒤' 등. bare '~고 '는 '하고|되고|이고|보고'+공백 등 보수 한정 — '재고/최고' 같은 명사 절단 금지)에
+품질 게이트 적용: 부질의 최소 6자, 단독 용언·조각 드랍(공백 포함 2어절 미만이면서 8자 미만). 게이트 후 1개면 원질의 그대로 /
+llm: chatJSON 1회(JSON 배열 요청, 실패 시 원질의 1개 폴백 — llmCalls 자연 계상). trace에 '질의 분해: N개'를 남긴다.
+
+### catalogIndex.js / catalogGraph.js 검색 옵션 (요약 — 상세는 SPEC-GRAPH.md)
+
+```js
+// catalogIndex.js
+retrieve(query, opts)            // opts 확장: hybridFusion: 'weighted'|'rrf'(기본 'weighted'=현행), rrfK: 60 — hybrid일 때만 의미.
+                                 // 'rrf': vector 순위·BM25 순위를 Σ 1/(rrfK+rank)로 융합. 단 무신호 랭커(원점수 분산 0=전 문서
+                                 // 동일 점수, 또는 BM25 raw 전부 0)는 합산에서 기여를 생략한다 — 무신호 랭커의 순위는 등록 순서
+                                 // 노이즈라 융합 결과를 오염시키기 때문.
+                                 // (threshold는 융합 점수가 아닌 기존 개별 정규화 점수 기준 유지)
+retrieveMulti(subQueries, opts)  // 부질의별 match만 수행(expandServer/expandCategory off, topK=opts.perK||4)
+                                 // → 라운드로빈(순위 교차) 병합·중복 제거 → opts.topK 절단 → 병합 결과에 expand 1회 적용
+                                 // (단일 retrieve 경로와 공급 대칭 — 부질의마다 expand하면 후보가 확장물로 희석돼 topK 절단 시
+                                 // 정답 도구가 밀려나는 문제를 방지). 부질의 1개면 retrieve 위임.
+                                 // 반환 형태는 retrieve와 동일(usedMethod/fallbackReason은 첫 성공 기준 + 병합 표기)
+// catalogGraph.js
+graphRetrieve(query, opts)       // opts 확장: queries?: string[](있으면 부질의별 시드 검색 — 시드는 부질의별 라운드로빈으로 선정
+                                 // [각 부질의 ranked 1위부터 교차, 중복 제거, seedK개] → 측면 대표성 보장. relevance는 노드별
+                                 // max-병합 유지하되 부질의별 정규화 대신 병합 후 전역 1회 정규화 — 노이즈 조각 부질의가
+                                 // 만점(1.0) 시드가 되는 문제 완화. 이후 기존 확산),
+                                 // relBonus?: 0.5(그래프 확산 점수·질의 관련도 블렌드 가중 — 기본=현행 상수),
+                                 // relevanceK?: 15(시드 관련도 산출 폭 — 기본=현행 상수),
+                                 // includeRelTopN?: 0(>0이면 "시드(seedK) 제외" relevance 상위 N개 노드를 — 시드 오프셋 적용,
+                                 // 유효 상한 min(N, relevanceK−seedK) — 그래프 비도달이어도 rel×relBonus 점수로 후보 편입.
+                                 // 구 의미 "관련도 상위 N"은 상위 N이 항상 시드와 겹쳐 no-op였음)
+```
+
+검토 후 기각/보류된 검색 개선안(설계 결정 기록 — 재검토 시 참조, 구현하지 말 것):
+- **vector io-인접 확장(기각)** — graph 전략의 io 확산과 기능 중복(io 전용 도구는 expandServer/graph로 이미 커버).
+- **BM25 k1/b 노출(기각)** — 311개 초단문 코퍼스에서 변별 이동 기대 없음(hybrid 정규화가 스케일 흡수).
+- **lexical alias 질의 확장(기각)** — 이 코퍼스는 질의-도구 어휘 중첩이 높아 이득 불명확. multiQuery가 지배 실패(측면 희석)를 직접 타격.
+- **HyDE·LLM 질의확장·신규 엣지·계층 인덱스(기각)** — 비용/리스크 대비 측정 가능한 이득 없음.
+- **LLM 재랭킹(보류→후속)** — retrievalRecall 데이터 축적 후 재평가. "recall 높음 + F1 낮음" 패턴이 없으면 영구 기각.
+- **별도 hybrid store(기각)** — graph가 이미 벡터 시드+확산 구조. relBonus/relevanceK/includeRelTopN 노출로 대체.
+- **expandServer cap(기각)** — 동작 변경 대신 suppliedToolCount 기록으로 관찰 가능화.
+- **multiSeed 부질의 감쇠(1/√n) 실험(후속)** — retrievalRecall 데이터 축적 후 검토.
+- **retrieveMulti 폴백 사유 중첩 괄호 가독성(후속)** — E2E 관찰 사항. 병합 표기의 괄호 중첩 표기 개선만 필요(동작 무관).
+
+관찰 사항(동작 변경 없음): keyword(BM25)는 2-gram 토큰화 특성상 거의 모든 질의가 어떤 도구와든 일부 토큰이 겹쳐
+'검색 0건' 폴백이 사실상 발생하지 않는다(무신호에 가까운 후보라도 상시 반환). 따라서 keyword 계열의 검색 품질 문제는
+retrievalFallback이 아니라 retrievalRecall/goalRetrieved 지표로 관찰할 것.
 
 ## 8. evaluator.js (계약)
 
@@ -311,8 +408,18 @@ export function summarize(items)                  // SummaryMetrics
 export async function runEvaluation({ benchmarkSet, strategies, mcps, model, temperature, maxSteps, onProgress, signal })
 // model 지정 시 모든 전략에 강제 적용(공정 비교). temperature 지정 시 config.temperature 강제.
 // maxSteps: 유한 양수이면 prompt/db 전략의 config.maxSteps를 실행용 클론에서 오버라이드(원본 전략 무변경, rule/skill 제외).
-// 항목에 hasStepErrors/usedFallback 기록, metrics에 토큰·ctxOverflow·retrievalFallback 병합.
-// summarize에 fallbackRate·avgF1Matched(폴백 제외 F1)·ctxOverflowCount·retrievalFallbackCount 포함.
+// 항목에 hasStepErrors/usedFallback 기록, metrics에 토큰·ctxOverflow·retrievalFallback·catalogDetail·retrievalRecall·goalRetrieved(·suppliedToolCount) 병합.
+// retrievalRecall: res.retrievedTools가 배열일 때 — primary+alternatives 전 gold 후보 각각의 도구 키 후보 포함 비율 중
+//   최대(최대 커버리지 — 기회 상한). 그 외(전체 주입/기록 없음)는 null.
+//   [설계 결정] 채택-gold(F1 최대 후보) 기준 기각 — 채택이 actual(플래너 출력)에 의존해 순환성 발생(§3 ItemMetrics 참조).
+// goalRetrieved: res.retrievedTools가 배열일 때 — goal 후보(item.goal 있으면 그것, 없으면 primary·각 alternative의
+//   마지막 step들) 중 하나라도 후보에 포함되면 true. 그 외는 null.
+// run.numCtx(실행 시점 settings.numCtx)·run.toolCount(실행 시점 전체 도구 수, mcps 기준 — orchestrator countTools 재사용
+//   또는 자체 계산)와 perStrategy.configSnapshot(§3 EvalRun의 슬림 규칙 — 유효 전략 기준, 존재 필드만,
+//   embedModel/extractModel/paramFill/onNoMatch/해석 model 포함) 기록.
+// summarize에 fallbackRate·avgF1Matched(폴백 제외 F1)·ctxOverflowCount·retrievalFallbackCount·catalogCompressedCount
+//   ·avgRetrievalRecall(null 제외 평균)·retrievalMissCount·goalMissCount(goalRetrieved===false 문항 수)·catalogDetailMax
+//   포함(구 run에 없는 키는 뷰에서 폴백 처리).
 // errorRate = (ok===false 또는 hasStepErrors) 항목 비율. EvalRun 반환(저장은 호출측)
 export function finalizeScores(run)               // run 레벨 후처리(runEvaluation 종료 시 자동 호출)
 // 전략 간 avgTotalTokens 비율로 tokenEfficiency(가장 적은 전략=1, run 내 상대)와

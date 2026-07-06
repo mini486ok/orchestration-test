@@ -1,6 +1,11 @@
 // 평가 지표 계산 + 평가 실행 오케스트레이션
 // SPEC §8 계약: scoreItem / summarize / runEvaluation
-import { executeStrategy } from './orchestrator.js';
+// r8: countTools는 orchestrator가 export 중이면 재사용(네임스페이스 import + typeof 가드 —
+//     export 부재 시에도 모듈 로드가 실패하지 않도록 named import를 쓰지 않는다).
+import * as orchestrator from './orchestrator.js';
+import { getNumCtx, getDefaultModel } from './ollama.js';
+
+const { executeStrategy } = orchestrator;
 
 /* ============================================================
    내부 유틸
@@ -182,6 +187,66 @@ function normalizeAlternative(alt) {
   return null;
 }
 
+/**
+ * r7 검색 리콜 — 검색(db/retrieval) 전략에서 정답 도구가 검색 후보에 포함된 비율.
+ * retrievedTools('serverId/toolName' 키 배열)가 기록된 문항에서, 다중정답 후보(primary + alternatives)
+ * 각각의 gold 도구 키 커버리지(고유 키 기준)를 구해 그 최댓값을 반환한다.
+ * null 규칙: retrievedTools가 배열이 아니면(전체 카탈로그 주입/폴백/기록 없음) null,
+ * gold 도구가 하나도 없는 문항(expected·alternatives 모두 빈 경우)도 null(N/A).
+ */
+function computeRetrievalRecall(retrievedTools, expected = [], alternatives = []) {
+  if (!Array.isArray(retrievedTools)) return null;
+  const supplied = new Set(retrievedTools.map((k) => String(k)));
+  // 다중정답 후보 수집 — scoreItem과 동일하게 빈 후보는 무시(normalizeAlternative 재사용)
+  const candidates = [];
+  if (Array.isArray(expected) && expected.length) candidates.push(expected);
+  const alts = Array.isArray(alternatives) ? alternatives : [];
+  for (const alt of alts) {
+    const norm = normalizeAlternative(alt);
+    if (norm && norm.steps.length) candidates.push(norm.steps);
+  }
+  let best = null;
+  for (const steps of candidates) {
+    const keys = new Set(steps.map(toolId));
+    if (!keys.size) continue;
+    let hit = 0;
+    for (const k of keys) if (supplied.has(k)) hit++;
+    const cov = hit / keys.size;
+    if (best == null || cov > best) best = cov;
+  }
+  return best;
+}
+
+/**
+ * r8 goalRetrieved — 검색 후보(retrievedTools)에 목표(goal) 도구가 포함됐는지. boolean|null.
+ * goal 후보 결정(계약 §공통):
+ *   - item.goal이 유효(serverId 또는 toolName 존재)하면 그 도구 1개.
+ *   - goal이 없으면 primary(expected)와 각 alternative(normalizeAlternative 정규화, 빈 후보 무시)의
+ *     "마지막 step"들 — 이 중 **하나라도** retrievedTools에 있으면 true, 모두 없으면 false.
+ * null 규칙: retrievedTools가 배열이 아니면(전체 카탈로그 주입/폴백/기록 없음) null,
+ * goal 후보가 하나도 없으면(goal·expected·alternatives 모두 빈 문항) null(N/A) —
+ * retrievalRecall의 gold 없음 N/A 정책과 동일(거짓 miss 집계 방지).
+ */
+function computeGoalRetrieved(retrievedTools, goal, expected = [], alternatives = []) {
+  if (!Array.isArray(retrievedTools)) return null;
+  const supplied = new Set(retrievedTools.map((k) => String(k)));
+  const targets = new Set();
+  const goalValid = goal && typeof goal === 'object' && (goal.serverId || goal.toolName);
+  if (goalValid) {
+    targets.add(toolId(goal));
+  } else {
+    if (Array.isArray(expected) && expected.length) targets.add(toolId(expected[expected.length - 1]));
+    const alts = Array.isArray(alternatives) ? alternatives : [];
+    for (const alt of alts) {
+      const norm = normalizeAlternative(alt);
+      if (norm && norm.steps.length) targets.add(toolId(norm.steps[norm.steps.length - 1]));
+    }
+  }
+  if (!targets.size) return null;
+  for (const t of targets) if (supplied.has(t)) return true;
+  return false;
+}
+
 /** 하나의 정답 후보에 대한 채점 (ordered=false면 순서 무관 지표 사용) */
 function scoreOne(exp, act, ordered) {
   const expSeq = exp.map(toolId);
@@ -297,7 +362,11 @@ export function summarize(items = []) {
       avgCallSuccessRate: null, avgExtraToolRate: 0, goalAchievementRate: null,
       avgInputTokens: 0, avgOutputTokens: 0, avgTotalTokens: 0, totalTokens: 0,
       anyTokensEstimated: false, avgComposite: 0,
-      ctxOverflowCount: 0, retrievalFallbackCount: 0,
+      ctxOverflowCount: 0, retrievalFallbackCount: 0, catalogCompressedCount: 0,
+      // r7 신규
+      avgRetrievalRecall: null, retrievalMissCount: 0, catalogDetailMax: 0,
+      // r8 신규
+      goalMissCount: 0,
     };
   }
   const mean = (fn) => items.reduce((s, it) => s + (Number(fn(it)) || 0), 0) / n;
@@ -320,6 +389,11 @@ export function summarize(items = []) {
   const goalItems = items.filter((it) => it.metrics && it.metrics.goalAchieved != null);
   const goalAchievementRate = goalItems.length
     ? goalItems.reduce((s, it) => s + it.metrics.goalAchieved, 0) / goalItems.length
+    : null;
+  // r7 검색 리콜: null(전체 주입/기록 없음) 항목은 평균에서 제외 — 검색 전략에만 의미
+  const rrItems = items.filter((it) => it.metrics && it.metrics.retrievalRecall != null);
+  const avgRetrievalRecall = rrItems.length
+    ? rrItems.reduce((s, it) => s + it.metrics.retrievalRecall, 0) / rrItems.length
     : null;
 
   return {
@@ -351,6 +425,14 @@ export function summarize(items = []) {
     // 신뢰도 카운트: ctxOverflow=true 항목 수 / retrievalFallback 비null 항목 수
     ctxOverflowCount: items.filter((it) => it.metrics && it.metrics.ctxOverflow).length,
     retrievalFallbackCount: items.filter((it) => it.metrics && it.metrics.retrievalFallback != null).length,
+    // 카탈로그 자동 축약이 적용된 문항 수(catalogDetail>0) — 구버전 run(필드 없음)은 0으로 취급
+    catalogCompressedCount: items.filter((it) => it.metrics && (it.metrics.catalogDetail || 0) > 0).length,
+    // r7 신규 — 검색 리콜 평균(null 제외)·리콜<1 문항 수·카탈로그 축약 레벨 최댓값(0~4)
+    avgRetrievalRecall,
+    retrievalMissCount: rrItems.filter((it) => it.metrics.retrievalRecall < 1).length,
+    catalogDetailMax: items.reduce((m, it) => Math.max(m, Number(it.metrics?.catalogDetail) || 0), 0),
+    // r8 신규 — 목표 도구가 검색 후보에서 누락된 문항 수(goalRetrieved===false만 — null(N/A)은 제외)
+    goalMissCount: items.filter((it) => it.metrics && it.metrics.goalRetrieved === false).length,
   };
 }
 
@@ -395,6 +477,94 @@ function defaultRunName() {
 }
 
 /* ============================================================
+   r7 run 재현성 스냅샷 — numCtx · configSnapshot(슬림)
+   ============================================================ */
+
+/** JSON 깊은 복사(직렬화 불가 값은 undefined — 함수 등은 자연 배제) */
+function jsonClone(v) {
+  if (v === undefined) return undefined;
+  try { return JSON.parse(JSON.stringify(v)); } catch { return undefined; }
+}
+
+/** source에서 존재(≠undefined)하는 keys만 깊은 복사한 객체. 담긴 게 없으면 undefined. */
+function pickClone(source, keys) {
+  if (!source || typeof source !== 'object') return undefined;
+  const out = {};
+  let any = false;
+  for (const k of keys) {
+    if (source[k] === undefined) continue;
+    const c = jsonClone(source[k]);
+    if (c === undefined) continue;
+    out[k] = c;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
+// 스냅샷 화이트리스트(계약 §공통) — 함수·거대 텍스트(systemPrompt/selectorPrompt/fallbackPrompt/rules/skills 등) 제외.
+// retrieval(prompt 전략의 catalogMode='retrieval' 설정)은 vector와 동일 개념이므로 같은 핵심 필드를 담는다.
+// r8: embedModel(vector·retrieval·graph)·extractModel(graph) 추가 — null도 기록(=기본 모델 사용 표시).
+const SNAPSHOT_VECTOR_KEYS = ['method', 'topK', 'threshold', 'hybridAlpha', 'mmrLambda', 'docFields',
+  'expandServer', 'expandCategory', 'hybridFusion', 'multiQuery', 'embedModel'];
+const SNAPSHOT_GRAPH_KEYS = ['seedMethod', 'seedK', 'hops', 'decay', 'topK', 'maxDegree', 'hubNorm',
+  'path', 'relBonus', 'relevanceK', 'includeRelTopN', 'multiSeed', 'embedModel', 'extractModel'];
+
+/** graph.edges 요약 — 엣지 타입별 {on, weight, threshold}만 (존재 필드만) */
+function snapshotGraphEdges(edges) {
+  if (!edges || typeof edges !== 'object') return undefined;
+  const out = {};
+  let any = false;
+  for (const name of Object.keys(edges)) {
+    const s = pickClone(edges[name], ['on', 'weight', 'threshold']);
+    if (s) { out[name] = s; any = true; }
+  }
+  return any ? out : undefined;
+}
+
+/**
+ * 실행 시점 전략 구성의 슬림 스냅샷(run 재현성용) — effStrategy(오버라이드 적용 후) 기준, 존재 필드만 JSON 깊은 복사.
+ * 포함: type, model(해석값 — effStrategy.model ?? getDefaultModel(), 항상 기록), planningMode, catalogMode,
+ *       store, maxSteps, temperature, paramFill(skill), onNoMatch(rule),
+ *       catalog{fields,autoFit}, vector/retrieval 핵심(embedModel 포함),
+ *       graph 핵심(embedModel/extractModel·edges on/weight/threshold 요약 포함).
+ */
+function buildConfigSnapshot(effStrategy) {
+  const cfg = (effStrategy && effStrategy.config) || {};
+  const snap = { type: effStrategy?.type };
+  // r8: model은 해석값을 항상 기록 — 전략에 미설정(null)이면 실행 시점 기본 모델로 해석되므로 그 값을 남긴다.
+  snap.model = jsonClone(effStrategy?.model ?? getDefaultModel());
+  // paramFill(skill 전략)·onNoMatch(rule 전략)는 해당 전략 config에만 존재 — 존재 필드만 담는 규칙 그대로.
+  for (const k of ['planningMode', 'catalogMode', 'store', 'maxSteps', 'temperature', 'paramFill', 'onNoMatch']) {
+    if (cfg[k] !== undefined) {
+      const c = jsonClone(cfg[k]);
+      if (c !== undefined) snap[k] = c;
+    }
+  }
+  const catalog = pickClone(cfg.catalog, ['fields', 'autoFit']);
+  if (catalog) snap.catalog = catalog;
+  const vector = pickClone(cfg.vector, SNAPSHOT_VECTOR_KEYS);
+  if (vector) snap.vector = vector;
+  const retrieval = pickClone(cfg.retrieval, SNAPSHOT_VECTOR_KEYS);
+  if (retrieval) snap.retrieval = retrieval;
+  if (cfg.graph && typeof cfg.graph === 'object') {
+    const graph = pickClone(cfg.graph, SNAPSHOT_GRAPH_KEYS) || {};
+    const edges = snapshotGraphEdges(cfg.graph.edges);
+    if (edges) graph.edges = edges;
+    if (Object.keys(graph).length) snap.graph = graph;
+  }
+  return snap;
+}
+
+/**
+ * r8 run.toolCount — 실행 시점 mcps 전체 도구 수. orchestrator.countTools export가 있으면 재사용,
+ * 없으면(구버전/병렬 배포 중) 동일 정의로 자체 계산 폴백.
+ */
+function countAllTools(mcps) {
+  if (typeof orchestrator.countTools === 'function') return orchestrator.countTools(mcps);
+  return (mcps || []).reduce((s, m) => s + ((m && Array.isArray(m.tools)) ? m.tools.length : 0), 0);
+}
+
+/* ============================================================
    §8 runEvaluation
    ============================================================ */
 
@@ -432,6 +602,8 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
     model: model || null,
     temperature: tempOverride,
     maxSteps: maxStepsOverride,
+    numCtx: getNumCtx(), // r7: 실행 시점 num_ctx — 다른 numCtx의 run 간 축약/오버플로 비교 불가 표시용
+    toolCount: countAllTools(mcps), // r8: 실행 시점 전체 도구 수(재현성 — 카탈로그 규모가 다른 run 간 비교 주의 표시용)
     perStrategy: {},
   };
 
@@ -461,6 +633,9 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
       let hasStepErrors = false, usedFallback = false;
       let inputTokens = 0, outputTokens = 0, tokensEstimated = false;
       let ctxOverflow = false, retrievalFallback = null; // 신뢰도 플래그(res에 없으면 기본값 유지)
+      let catalogDetail = 0; // 카탈로그 자동 축약 레벨(0=전체 상세 — res에 없으면 0)
+      let retrievedTools = null;   // r7: 검색 최종 후보 도구 키 배열(전체 주입/기록 없음이면 null)
+      let suppliedToolCount = null; // r7: 플래너에 실제 공급된 도구 수(기록 없으면 null)
       try {
         const res = await executeStrategy(effStrategy, item.query, { mcps, signal });
         actual = res?.steps || [];
@@ -477,6 +652,11 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
         // 신뢰도 플래그: 컨텍스트 초과(카탈로그가 numCtx를 넘어 잘렸을 가능성)·검색 폴백 사유
         ctxOverflow = !!res?.ctxOverflow;
         retrievalFallback = res?.retrievalFallback ?? null;
+        catalogDetail = res?.catalogDetail ?? 0;
+        // r7: 검색 후보 기록(배열일 때만 — 전체 주입/폴백/구버전 결과는 null 유지)
+        retrievedTools = Array.isArray(res?.retrievedTools) ? res.retrievedTools : null;
+        suppliedToolCount = (typeof res?.suppliedToolCount === 'number' && Number.isFinite(res.suppliedToolCount))
+          ? res.suppliedToolCount : null;
         if (res && res.ok === false && res.error) error = res.error;
       } catch (e) {
         if (signal?.aborted || e?.name === 'AbortError') { cancelled = true; break; }
@@ -498,6 +678,12 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
       // 신뢰도 플래그를 metrics에 기록(res에 필드가 없으면 false/null)
       metrics.ctxOverflow = ctxOverflow;
       metrics.retrievalFallback = retrievalFallback;
+      metrics.catalogDetail = catalogDetail;
+      // r7: 검색 리콜(다중정답 후보별 커버리지 max — null=전체 주입/기록 없음/gold 없음) + 공급 도구 수 보존
+      metrics.retrievalRecall = computeRetrievalRecall(retrievedTools, item.expected || [], item.alternatives);
+      metrics.suppliedToolCount = suppliedToolCount;
+      // r8: 목표 도구가 검색 후보에 포함됐는지(true/false — null=retrievedTools 없음/goal 후보 없음)
+      metrics.goalRetrieved = computeGoalRetrieved(retrievedTools, item.goal, item.expected || [], item.alternatives);
       perItems.push({
         itemId: item.id,
         query: item.query,
@@ -521,6 +707,7 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
     run.perStrategy[strategy.id] = {
       strategyName: strategy.name,
       strategyType: strategy.type,
+      configSnapshot: buildConfigSnapshot(effStrategy), // r7: 실행 시점 구성 스냅샷(오버라이드 반영·슬림)
       items: perItems,
       summary: summarize(perItems),
     };

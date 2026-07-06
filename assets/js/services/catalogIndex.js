@@ -5,10 +5,13 @@
 //  buildIndex({mcps, embedModel, docFields, onProgress})  도구 단위 문서 임베딩 → store 'catalogIndex'
 //  indexStatus(mcps, embedModel, docFields)               인덱스 존재/stale/도구수/모델/구축시각
 //  retrieve(query, {mcps, ...retrieval파라미터, docFields, mmrLambda}) vector·keyword·hybrid 검색 + 확장
+//  retrieveMulti(subQueries, opts)                        부질의별 match 검색 → 라운드로빈 병합 → topK 절단 → 확장 1회(멀티 질의)
 //
 // v2(§2): 청킹 없음(도구당 1벡터 유지). 대신 임베딩 문서 구성 토글(docFields) + MMR 다양성(mmrLambda) 추가.
 //   docFields={desc,params,outputs,examples,tags} 기본 {desc,params}만 켜 현행과 100% 동일 출력.
 //   mmrLambda 1.0(기본)=순수 관련도(현행), <1.0이면 검색 결과를 MMR로 재랭킹(문서 벡터 재사용).
+// v3(§F2): hybrid 융합 방식 토글(hybridFusion) 추가 — 'weighted'(기본, 현행 정규화 점수 가중합 그대로) |
+//   'rrf'(Reciprocal Rank Fusion, rrfK 기본 60). retrieveMulti(부질의 라운드로빈 병합) 신설.
 //
 // 저장 형태(store 'catalogIndex'):
 //  { builtAt, embedModel, dim, docs: [{ serverId, toolName, text, vec(소수4자리) }], docFields, mcpsFingerprint }
@@ -218,6 +221,14 @@ function minmax(vals) {
   return vals.map(v => (v - mn) / range);
 }
 
+/** 값 배열의 내림차순 1-based 순위(동점은 원래 인덱스 순으로 안정 배정). RRF 융합용. */
+function ranksDesc(vals) {
+  const order = vals.map((_, i) => i).sort((x, y) => (vals[y] - vals[x]) || (x - y));
+  const rank = new Array(vals.length);
+  order.forEach((idx, pos) => { rank[idx] = pos + 1; });
+  return rank;
+}
+
 /**
  * MMR(Maximal Marginal Relevance) 재랭킹(§2) — 관련도와 다양성을 λ로 절충한다.
  * 각 단계에서 score = λ·rel(q,d) − (1−λ)·max_{s∈선택} cos(d, s) 가 최대인 후보를 탐욕적으로 선택한다.
@@ -399,16 +410,20 @@ function expand(matches, mcps, { expandServer, expandCategory }) {
  * 질의로 관련 도구를 검색한다.
  * @param {string} query
  * @param {{mcps:Array, method?:'vector'|'keyword'|'hybrid', topK?:number, threshold?:number,
- *          hybridAlpha?:number, expandServer?:boolean, expandCategory?:boolean,
+ *          hybridAlpha?:number, hybridFusion?:'weighted'|'rrf', rrfK?:number,
+ *          expandServer?:boolean, expandCategory?:boolean,
  *          embedModel?:string, docFields?:object, mmrLambda?:number, signal?:AbortSignal}} opts
  *   docFields: 문서 구성 토글(stale 판정·키워드 코퍼스에 사용, 미지정 시 인덱스 구축값/기본값).
  *   mmrLambda: 1.0(기본)=순수 관련도(현행), <1.0이면 MMR 재랭킹으로 다양성 확보(문서 벡터 재사용, 추가 임베딩 없음).
+ *   hybridFusion(§F2, hybrid일 때만 의미): 'weighted'(기본)=코사인·BM25 min-max 정규화 후 alpha 가중합(현행
+ *   경로 그대로), 'rrf'=Reciprocal Rank Fusion(점수 스케일 대신 두 랭킹의 순위로 융합, rrfK 기본 60).
  * @returns {Promise<{results:Array, usedMethod:string, requestedMethod:string,
  *          fallbackReason:string|null, topK:number, threshold:number}>}
  */
 export async function retrieve(query, {
   mcps = [], method = 'hybrid', topK = 8, threshold = 0,
-  hybridAlpha = 0.5, expandServer = true, expandCategory = false,
+  hybridAlpha = 0.5, hybridFusion = 'weighted', rrfK = 60,
+  expandServer = true, expandCategory = false,
   embedModel = 'bge-m3:latest', docFields, mmrLambda = 1, signal,
 } = {}) {
   const q = String(query || '').trim();
@@ -465,7 +480,7 @@ export async function retrieve(query, {
       scored = vectorScores(qvec, idx, keyToIndex, currentTools)
         .map(({ serverId, toolName, score }) => ({ serverId, toolName, score }));
     }
-  } else { // hybrid — 코사인·BM25 각각 min-max 정규화 후 alpha 가중합
+  } else { // hybrid — weighted(기본): 정규화 점수 가중합(현행) / rrf: 순위 융합(RRF)
     const qvec = await embedQuery(q, embedModel, signal);
     if (idxDim && qvec.length !== idxDim) {
       usedMethod = 'keyword';
@@ -475,21 +490,52 @@ export async function retrieve(query, {
       const vec = vectorScores(qvec, idx, keyToIndex, currentTools); // 공통(인덱스∩현재) 집합
       if (vec.length) {
         const model = buildBM25(currentTools);
-        const vecVals = minmax(vec.map(v => v.score));
-        const bmVals = minmax(vec.map(v => bm25ScoreAt(model, qTerms, v.i)));
+        const vecRaw = vec.map(v => v.score);
+        const bmRaw = vec.map(v => bm25ScoreAt(model, qTerms, v.i));
+        const vecVals = minmax(vecRaw);
+        const bmVals = minmax(bmRaw);
         const a = Math.min(1, Math.max(0, Number(hybridAlpha)));
-        scored = vec.map((v, n) => ({
-          serverId: v.serverId, toolName: v.toolName,
-          score: a * vecVals[n] + (1 - a) * bmVals[n],
-        }));
+        if (hybridFusion === 'rrf') {
+          // RRF(Reciprocal Rank Fusion, §F2): 점수 스케일 대신 "순위"로 융합 — score = Σ 1/(rrfK+rank).
+          // [threshold 의미 — 중요] RRF 융합 점수는 상한이 2/(rrfK+1)≈0.033(rrfK=60)으로 스케일이 작아,
+          // 0~1 정규화 점수를 전제한 기존 threshold를 융합 점수에 그대로 대면 전부 잘려나간다. 따라서
+          // threshold는 융합 점수가 아니라 종전 weighted와 동일한 "개별 정규화 점수의 가중합"
+          // (a*vecNorm+(1-a)*bmNorm, 아래 gateScore) 기준으로 유지하고, RRF 점수(score)는 순위 결정에만 쓴다.
+          // [무신호 랭커 제외 — §H1] 원점수가 전부 동일(분산 0)한 랭커(BM25 raw 전부 0 포함)는 순위가
+          // "등록 순서"일 뿐 정보가 없으므로 1/(K+rank) 기여를 생략한다 — 등록 순서 노이즈가 융합 순위를
+          // 흔들지 않게. 두 랭커 모두 무신호면 전원 0점 동률(안정 정렬로 원 순서 유지, gateScore는 종전대로).
+          const K = Math.max(1, Number(rrfK) || 60);
+          const spread = (vals) => {
+            let mn = Infinity, mx = -Infinity;
+            for (const v of vals) { if (v < mn) mn = v; if (v > mx) mx = v; }
+            return mx - mn;
+          };
+          const vecSignal = spread(vecRaw) > 1e-12;
+          const bmSignal = spread(bmRaw) > 1e-12;
+          const vecRank = ranksDesc(vecVals);
+          const bmRank = ranksDesc(bmVals);
+          scored = vec.map((v, n) => ({
+            serverId: v.serverId, toolName: v.toolName,
+            score: (vecSignal ? 1 / (K + vecRank[n]) : 0) + (bmSignal ? 1 / (K + bmRank[n]) : 0),
+            gateScore: a * vecVals[n] + (1 - a) * bmVals[n], // threshold 게이트 전용(결과에는 미포함)
+          }));
+        } else { // 'weighted'(기본) — 현행 경로 그대로
+          scored = vec.map((v, n) => ({
+            serverId: v.serverId, toolName: v.toolName,
+            score: a * vecVals[n] + (1 - a) * bmVals[n],
+          }));
+        }
       }
     }
   }
 
-  // threshold 필터 → 점수 내림차순
+  // threshold 필터 → 점수 내림차순. threshold는 각 방식의 "기존 점수"(keyword=BM25 원점수, vector=코사인,
+  // hybrid=개별 정규화 가중합) 기준 — hybridFusion='rrf'일 때도 gateScore(가중합)로 게이트하고
+  // 정렬·상위 선정만 RRF 점수(score)로 한다. gateScore가 없으면(비-rrf 경로) 종전대로 score로 게이트.
   const filtered = scored
-    .filter(s => s.score >= threshold)
-    .sort((x, y) => y.score - x.score);
+    .filter(s => (s.gateScore !== undefined ? s.gateScore : s.score) >= threshold)
+    .sort((x, y) => y.score - x.score)
+    .map(({ serverId, toolName, score }) => ({ serverId, toolName, score })); // gateScore 등 내부 필드 제거
   // mmrLambda < 1이면 MMR 재랭킹으로 다양성 확보(인덱스 벡터 재사용). 1.0/미지정이면 순수 관련도 topK(현행).
   const lam = Number.isFinite(mmrLambda) ? mmrLambda : 1;
   let picked;
@@ -505,4 +551,83 @@ export async function retrieve(query, {
 
   const results = expand(matches, mcps, { expandServer, expandCategory });
   return { results, usedMethod, requestedMethod: method, fallbackReason, topK: k, threshold };
+}
+
+/**
+ * 멀티 질의 검색(§F2, 구조 §H1) — "부질의별 match 검색 → 라운드로빈 병합 → topK 절단 → 확장 1회".
+ * 각 부질의를 확장 없이(expandServer/expandCategory 강제 off) retrieve(topK=perK)로 검색한 뒤
+ * "부질의1의 1위 → 부질의2의 1위 → … → 부질의1의 2위 → …" 순서로 교차 병합하고, 중복(serverId/toolName)은
+ * 먼저 나온 항목을 남기며 제거, topK로 절단한 다음, 그 병합 결과에 확장(expand)을 1회 적용한다.
+ * 복합 질의를 측면별 부질의로 분해했을 때 각 측면의 상위 후보가 고르게 살아남게 하는 병합 방식이다.
+ *
+ * [§H1 구조 변경 이유] 종전에는 부질의별 retrieve가 확장까지 포함한 결과를 반환했고, 확장 항목이
+ * 라운드로빈 슬롯을 차지해 topK 절단 시 다른 부질의의 match를 밀어냈다(단일 경로는 "match topK 선정 후
+ * 확장"이라 공급량이 비대칭 — 실측 리콜 77.1% vs 병합후확장 89.2%). 지금은 단일 경로와 공급이 대칭이다.
+ *
+ * - 반환 형태는 retrieve와 동일: { results, usedMethod, requestedMethod, fallbackReason, topK, threshold }.
+ *   usedMethod/requestedMethod/threshold는 첫 부질의 결과 기준(폴백은 인덱스 상태에 좌우되므로 부질의 간
+ *   동일), fallbackReason은 부질의들의 사유를 중복 제거해 병합 표기한다.
+ * - results 순서: match(topK개 이하)는 "라운드로빈 병합 순서"(교차 순위가 곧 우선순위 — 점수 내림차순이
+ *   아님), 그 뒤에 확장 항목(source: 'expandServer'|'expandCategory')이 이어진다. 부질의 간 score는 직접
+ *   비교가 불가하므로 확장 항목을 match와 섞어 재정렬하지 않고 뒤에 덧붙인다(확장 항목끼리는 seed 점수
+ *   내림차순). score는 각 항목이 처음 나온 부질의 결과의 값을 그대로 유지한다.
+ * - 부질의가 1개면 retrieve(부질의, {...opts, topK})와 완전히 동일하게 동작한다(분해가 원질의 1개로
+ *   끝났을 때 비-멀티 경로와 결과가 달라지지 않게 — 회귀 방지).
+ * @param {string[]} subQueries 부질의 배열(빈 문자열은 무시)
+ * @param {{topK?:number, perK?:number}} opts perK(기본 4): 부질의별 retrieve topK. 나머지 옵션은
+ *   retrieve와 동일하게 각 부질의 호출에 그대로 전달된다(mcps, method, threshold, hybridFusion 등).
+ *   expandServer/expandCategory는 부질의 검색에는 적용하지 않고 병합 결과에 1회 적용한다.
+ * @returns {Promise<{results:Array, usedMethod:string, requestedMethod:string,
+ *          fallbackReason:string|null, topK:number, threshold:number}>}
+ */
+export async function retrieveMulti(subQueries, opts = {}) {
+  const list = (Array.isArray(subQueries) ? subQueries : [subQueries])
+    .map(s => String(s || '').trim())
+    .filter(Boolean);
+  const k = Math.max(1, Math.floor(opts.topK) || 8);
+  // 부질의 0개(빈 질의)·1개는 단일 retrieve로 위임 — 반환 형태·동작 모두 retrieve와 동일(회귀 없음).
+  if (!list.length) return retrieve('', { ...opts, topK: k });
+  if (list.length === 1) return retrieve(list[0], { ...opts, topK: k });
+
+  const perK = Math.max(1, Math.floor(opts.perK) || 4);
+  const subResults = [];
+  for (const sq of list) {
+    // 순차 실행: AbortSignal 전파·임베딩 호출 순서를 결정적으로 유지(ollama는 어차피 직렬 처리).
+    // §H1: 부질의 검색은 확장 없이 순수 match만(perK개) — 확장은 병합·절단 후 1회만 적용한다.
+    subResults.push(await retrieve(sq, { ...opts, topK: perK, expandServer: false, expandCategory: false }));
+  }
+
+  // 라운드로빈 병합: 각 부질의 match(점수순)의 i위를 부질의 순서대로 교차 채택 → topK 절단.
+  const merged = [];
+  const seen = new Set();
+  const maxLen = Math.max(...subResults.map(r => (r.results || []).length));
+  for (let i = 0; i < maxLen && merged.length < k; i++) {
+    for (const r of subResults) {
+      if (merged.length >= k) break;
+      const item = (r.results || [])[i];
+      if (!item) continue;
+      const key = `${item.serverId}/${item.toolName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(item);
+    }
+  }
+
+  // 병합 결과에 확장 1회 적용(단일 경로의 "match 선정 → 확장"과 공급 대칭 — §H1). match는 라운드로빈
+  // 순서를 유지하고(교차 순위가 곧 우선순위 계약), 새로 편입된 확장 항목만 뒤에 덧붙인다.
+  const expServer = opts.expandServer !== undefined ? !!opts.expandServer : true; // retrieve 기본값과 동일
+  const expCategory = opts.expandCategory !== undefined ? !!opts.expandCategory : false;
+  const expanded = expand(merged, opts.mcps || [], { expandServer: expServer, expandCategory: expCategory });
+  const results = [...merged, ...expanded.filter(e => e.source !== 'match')];
+
+  const first = subResults[0];
+  const reasons = [...new Set(subResults.map(r => r.fallbackReason).filter(Boolean))];
+  return {
+    results,
+    usedMethod: first.usedMethod,
+    requestedMethod: first.requestedMethod,
+    fallbackReason: reasons.length ? `부질의 ${list.length}개 병합: ${reasons.join(' / ')}` : null,
+    topK: k,
+    threshold: first.threshold,
+  };
 }

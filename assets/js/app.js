@@ -218,7 +218,7 @@ function renderShell() {
     el('div', { class: 'row' }, menuBtn, title),
     el('div', { class: 'topbar-right' },
       serverMode ? el('span', { class: 'badge green', title: '중앙 게이트웨이 서버 모드' }, '서버 모드') : null,
-      el('span', { class: 'badge dim mono', title: '빌드 2026-07-06 · MCP 100종·복합 시나리오 벤치마크 30문항·세트 조합 UI 개선 (샘플 병합 v4)', style: { fontFamily: 'var(--font-mono)' } }, 'v2.3')));
+      el('span', { class: 'badge dim mono', title: '빌드 2026-07-07 · 카탈로그 자동 축약·구성 선택, DB 검색 고도화(멀티질의·RRF·rel블렌드·검색리콜), 7관점 검증 2회', style: { fontFamily: 'var(--font-mono)' } }, 'v2.4')));
 
   const content = el('div', { class: 'content' });
   const main = el('main', { class: 'main' }, topbar, content);
