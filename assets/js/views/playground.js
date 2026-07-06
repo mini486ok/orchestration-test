@@ -279,7 +279,16 @@ export async function render(container, ctx) {
     const it = benchItem;
     const goal = (it.goal && it.goal.serverId) ? it.goal : null;
     const goalServer = goal ? mcps.find((m) => m.id === goal.serverId) : null;
-    const alts = Array.isArray(it.alternatives) ? it.alternatives.filter((a) => Array.isArray(a) && a.length) : [];
+    // 대안 정규화: 배열(기존) 또는 {steps, goal?} 객체(신규) 형태 모두 표시.
+    // 원본 인덱스(idx)를 유지해 결과 카드의 '대안 정답 #N' 뱃지 번호와 일치시킨다(evaluator의 matchedAlternative와 동일 기준).
+    const alts = (Array.isArray(it.alternatives) ? it.alternatives : [])
+      .map((a, idx) => {
+        const steps = Array.isArray(a) ? a : (a && Array.isArray(a.steps) ? a.steps : null);
+        if (!steps || !steps.length) return null;
+        const g = (!Array.isArray(a) && a.goal && typeof a.goal === 'object' && (a.goal.serverId || a.goal.toolName)) ? a.goal : null;
+        return { idx, steps, goal: g };
+      })
+      .filter(Boolean);
     benchExpect.replaceChildren(
       el('div', { class: 'row wrap', style: { gap: '6px', marginBottom: '8px' } },
         it.category ? badge(it.category) : null,
@@ -289,8 +298,15 @@ export async function render(container, ctx) {
       el('div', { class: 'pg-exp-block' },
         el('div', { class: 'pg-diff-label' }, '기대 워크플로우'),
         workflowChips(it.expected || [], mcps)),
-      ...alts.map((a, i) => el('div', { class: 'pg-exp-block' },
-        el('div', { class: 'pg-diff-label' }, `대안 #${i + 1}`), workflowChips(a, mcps))),
+      ...alts.map((a) => {
+        const gs = a.goal ? mcps.find((m) => m.id === a.goal.serverId) : null;
+        return el('div', { class: 'pg-exp-block' },
+          el('div', { class: 'pg-diff-label' }, `대안 #${a.idx + 1}`,
+            // 객체 대안의 자체 goal 소표기 — 이 대안이 채택되면 이 목표로 목표 달성률을 채점
+            a.goal ? el('span', { style: { color: 'var(--tx3)', fontWeight: 400 } },
+              ` · 목표: ${gs ? gs.icon + ' ' + gs.nameKo : (a.goal.serverId || '?')} / ${a.goal.toolName || '?'}`) : null),
+          workflowChips(a.steps, mcps));
+      }),
       el('div', { class: 'pg-exp-block' },
         el('div', { class: 'pg-diff-label' }, '목표 도구'),
         goal

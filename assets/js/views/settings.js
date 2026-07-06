@@ -15,7 +15,8 @@ const DEFAULT_SETTINGS = {
   defaultModel: 'exaone3.5:7.8b',
   temperature: 0.2,
   maxSteps: 6,
-  numCtx: 8192,
+  numCtx: 16384, // app.js·ollama.js 기본값과 통일
+  llmTimeoutSec: 300, // LLM 호출당 타임아웃(초). 0=무제한
 };
 
 export async function render(container) {
@@ -76,17 +77,33 @@ export async function render(container) {
     if (r.ok) refreshModels();
   }
 
-  // 고급: 컨텍스트 길이(num_ctx)
+  // 고급: 컨텍스트 길이(num_ctx) — 기본 16384(구버전 settings에 numCtx가 없어도 16384로 표시)
   const CTX_VALUES = [4096, 8192, 16384, 32768];
-  const curCtx = Number(settings.numCtx) > 0 ? Number(settings.numCtx) : 8192;
+  const curCtx = Number(settings.numCtx) > 0 ? Number(settings.numCtx) : 16384;
   const ctxSelect = el('select', {
     class: 'select',
     onchange: () => {
-      const v = Number(ctxSelect.value) > 0 ? Number(ctxSelect.value) : 8192;
+      const v = Number(ctxSelect.value) > 0 ? Number(ctxSelect.value) : 16384;
       patchSettings({ numCtx: v });
       toast(`컨텍스트 길이가 ${v.toLocaleString()} 토큰으로 설정되었습니다.`, 'success');
     },
   }, CTX_VALUES.map(v => el('option', { value: String(v), selected: v === curCtx }, `${v.toLocaleString()} 토큰`)));
+
+  // 고급: LLM 응답 타임아웃(초) — LLM 호출 1회당 적용. 0=무제한, 기본 300초
+  const curTimeoutSec = (() => {
+    const v = Number(settings.llmTimeoutSec);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 300;
+  })();
+  const timeoutInput = el('input', {
+    class: 'input mono-input', type: 'number', min: '0', step: '10', value: String(curTimeoutSec),
+    onchange: () => {
+      let v = Math.floor(Number(timeoutInput.value));
+      if (!Number.isFinite(v) || v < 0) v = 300;
+      timeoutInput.value = String(v);
+      patchSettings({ llmTimeoutSec: v });
+      toast(v === 0 ? 'LLM 타임아웃이 해제되었습니다(무제한).' : `LLM 타임아웃이 ${v}초로 설정되었습니다.`, 'success');
+    },
+  });
 
   const connCard = el('div', { class: 'card' },
     el('div', { class: 'panel-title' }, 'Ollama LLM 연결'),
@@ -139,7 +156,11 @@ export async function render(container) {
       el('button', { class: 'btn btn-ghost', onclick: refreshModels }, '목록 새로고침')),
     field({
       label: '컨텍스트 길이 (고급)', input: ctxSelect,
-      hint: 'LLM이 한 번에 처리하는 토큰 수(num_ctx). 값이 클수록 더 긴 문맥을 다루지만 메모리를 더 사용합니다. 기본 8192.',
+      hint: 'LLM이 한 번에 처리하는 토큰 수(num_ctx). 값이 클수록 더 긴 문맥을 다루지만 메모리를 더 사용합니다. 기본 16384.',
+    }),
+    field({
+      label: 'LLM 응답 타임아웃 (초, 고급)', input: timeoutInput,
+      hint: 'LLM 호출 1회가 이 시간을 넘으면 오류로 중단합니다 — 문항이 멈추는 것을 방지. 0=무제한. 기본 300초.',
     }));
 
   /* ---------- 중앙 게이트웨이 (서버 모드) ---------- */
@@ -476,7 +497,7 @@ export async function render(container) {
       }, '⬆ 데이터 가져오기'),
       el('button', {
         class: 'btn btn-amber', onclick: async () => {
-          if (!await confirmDialog('샘플 MCP 30개를 다시 시드합니다. 사용자가 만든 MCP는 유지됩니다. 계속할까요?', { danger: false })) return;
+          if (!await confirmDialog('샘플 MCP 100개를 다시 시드합니다. 사용자가 만든 MCP는 유지됩니다. 계속할까요?', { danger: false })) return;
           store.update('mcps', (mcps = []) => {
             const userMade = mcps.filter(m => !m.isSample);
             return [...SAMPLE_MCPS, ...userMade];

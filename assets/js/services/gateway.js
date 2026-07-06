@@ -315,10 +315,15 @@ export async function pullShared() {
   return updated;
 }
 
-async function doPush(key) {
-  if (!isServerMode()) return;
+/**
+ * 단일 공유 키를 서버로 PUT — doPush(디바운스 경로)와 pushSharedNow(즉시 경로)가 공용.
+ * 성공 시 lastVersions 갱신 + 경고 상태 리셋. 성공 여부(boolean)만 반환하고
+ * 실패 알림(토스트)은 호출자 몫으로 남긴다(경로별 알림 정책이 다르므로).
+ */
+async function putShared(key) {
+  if (!isServerMode()) return false;
   const items = store.get(key);
-  if (!Array.isArray(items)) return;
+  if (!Array.isArray(items)) return false;
   try {
     const res = await gwFetch('/data/' + key, {
       method: 'PUT',
@@ -329,12 +334,40 @@ async function doPush(key) {
     const data = await res.json().catch(() => ({}));
     if (data && data.updatedAt) lastVersions[key] = data.updatedAt;
     pushWarned[key] = false; // 성공 시 경고 상태 리셋
+    return true;
   } catch {
-    if (!pushWarned[key]) {
-      pushWarned[key] = true;
-      toast(`공유 데이터(${keyLabel(key)}) 서버 동기화에 실패했습니다. 변경 시 자동으로 다시 시도합니다.`, 'warn', 5000);
-    }
+    return false;
   }
+}
+
+async function doPush(key) {
+  if (!isServerMode()) return;
+  if (!Array.isArray(store.get(key))) return; // 기존 동작 유지: 배열이 아니면 조용히 건너뜀
+  const ok = await putShared(key);
+  if (!ok && !pushWarned[key]) {
+    pushWarned[key] = true;
+    toast(`공유 데이터(${keyLabel(key)}) 서버 동기화에 실패했습니다. 변경 시 자동으로 다시 시도합니다.`, 'warn', 5000);
+  }
+}
+
+/**
+ * 공유 키들을 디바운스 없이 즉시 서버로 PUT(순차 await).
+ * - 각 키의 예약된 디바운스 push는 취소한다(같은 데이터의 중복 PUT 방지).
+ * - 성공한 키는 putShared 내부에서 lastVersions가 갱신된다.
+ * - 반환: { ok: 전부 성공 여부, failed: 실패한 키 목록 }
+ * - 서버 모드가 아니면 아무것도 전송하지 않고 { ok:false, failed:[요청 키 전부] } 반환
+ *   (호출자는 서버 모드에서만 호출하는 것이 계약이지만 방어적으로 처리).
+ */
+export async function pushSharedNow(keys = SHARED_KEYS) {
+  const targets = (Array.isArray(keys) ? keys : []).filter((k) => SHARED_KEYS.includes(k));
+  if (!isServerMode()) return { ok: false, failed: targets.slice() };
+  const failed = [];
+  for (const key of targets) {
+    clearTimeout(pushTimers[key]); // 지금 즉시 push하므로 예약분은 취소
+    const ok = await putShared(key);
+    if (!ok) failed.push(key);
+  }
+  return { ok: failed.length === 0, failed };
 }
 
 /** 공유 키 변경을 2초 debounce 후 서버로 PUT (서버 모드에서만). */

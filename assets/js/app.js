@@ -42,7 +42,8 @@ function currentIdentity() {
 /* ---------- 초기 데이터 시드 (기대 타입이 아니면 방어적으로 재시드) ---------- */
 // 샘플 데이터 버전 — 이 값을 올리면 로컬(seed)과 게이트웨이(syncSamplesToGateway) 양쪽에서
 // 신규 기본 샘플이 기존 사용자/서버 저장소에 병합된다.
-const SAMPLE_VERSION = 3;
+// v4: 복합 시나리오 검증 세트(bench-set-complex, 30문항) 추가.
+const SAMPLE_VERSION = 4;
 
 function seed() {
   const settings = store.get('settings');
@@ -217,7 +218,7 @@ function renderShell() {
     el('div', { class: 'row' }, menuBtn, title),
     el('div', { class: 'topbar-right' },
       serverMode ? el('span', { class: 'badge green', title: '중앙 게이트웨이 서버 모드' }, '서버 모드') : null,
-      el('span', { class: 'badge dim mono', title: '빌드 2026-07-05 · MCP 100종·DB전략·실시간테스트·분야별 벤치마크 (샘플 병합 v3, 게이트웨이 자동 병합)', style: { fontFamily: 'var(--font-mono)' } }, 'v2.2')));
+      el('span', { class: 'badge dim mono', title: '빌드 2026-07-06 · MCP 100종·복합 시나리오 벤치마크 30문항·세트 조합 UI 개선 (샘플 병합 v4)', style: { fontFamily: 'var(--font-mono)' } }, 'v2.3')));
 
   const content = el('div', { class: 'content' });
   const main = el('main', { class: 'main' }, topbar, content);
@@ -435,23 +436,53 @@ async function bootServer() {
 // 신규 샘플(id 미존재)을 병합해 서버로 push 한다. 게이트웨이별(gwSeed:<url>) SAMPLE_VERSION
 // 기준으로 1회만 수행 → 매 접속마다 삭제된 샘플을 되살리거나 불필요하게 push 하지 않는다.
 // 병합은 "추가"만 하므로 서버에 있던 사용자 데이터를 지우지 않는다(비파괴적). pullShared 직후
-// (startSharedSync 구독 활성 상태)에 호출되어야 store.set → 서버 push 가 동작한다.
+// 호출해 서버 최신본에 병합하며, 전송은 pushSharedNow(즉시 PUT)로 확정하고 성공 시에만
+// gwSeed 버전을 기록한다(실패 시 다음 로드에 재시도).
 async function syncSamplesToGateway() {
   if (!gateway.isServerMode()) return;
   const url = gateway.getGatewayUrl() || '';
   const gateKey = 'gwSeed:' + url;
   if (Number(store.get(gateKey) || 0) >= SAMPLE_VERSION) return; // 이 게이트웨이엔 이미 반영됨
   const specs = [['mcps', SAMPLE_MCPS], ['strategies', SAMPLE_STRATEGIES], ['benchmarks', SAMPLE_BENCHMARKS]];
-  let added = 0;
-  for (const [key, samples] of specs) {
+  // 로컬 스토어 병합 저장 — store.set은 용량 초과 등 실패 시 false를 반환하고 롤백한다.
+  // 서버 전송은 아래 pushSharedNow가 즉시 확정한다.
+  const mergeLocal = (key, samples) => {
     const cur = store.get(key);
     const base = Array.isArray(cur) ? cur : [];
     const ids = new Set(base.map((x) => x && x.id));
     const additions = samples.filter((s) => s && s.id && !ids.has(s.id));
-    added += additions.length;
-    // 항상 store.set → 구독자(startSharedSync)가 서버로 push. 서버가 해당 키(예: mcps)를
-    // 아직 갖고 있지 않아도 확실히 반영된다. 추가만 하므로 비파괴적.
-    store.set(key, additions.length ? [...base, ...additions] : base);
+    if (!additions.length) return { ok: true, added: 0 };
+    const ok = store.set(key, [...base, ...additions]);
+    return { ok, added: ok ? additions.length : 0 };
+  };
+  const results = new Map(specs.map(([key, samples]) => [key, mergeLocal(key, samples)]));
+  // 저장 실패 시: seed()와 동일하게 실행 이력(runs)을 최근 5개만 남겨 공간을 확보한 뒤
+  // 실패한 키만 1회 재시도한다(실행 이력은 재생성 가능한 데이터).
+  if (specs.some(([key]) => !results.get(key).ok)) {
+    const runs = store.get('runs');
+    if (Array.isArray(runs) && runs.length > 5) store.set('runs', runs.slice(-5));
+    for (const [key, samples] of specs) {
+      if (!results.get(key).ok) results.set(key, mergeLocal(key, samples));
+    }
+  }
+  if (specs.some(([key]) => !results.get(key).ok)) {
+    // 여전히 실패 → 로컬에 병합되지 않은 채 push 하면 서버 반영이 불완전해지므로
+    // push/gwSeed 확정을 중단한다(gwSeed 미기록 → 다음 로드에 자동 재시도).
+    console.warn('[syncSamplesToGateway] 샘플 로컬 병합 저장 실패 — push/gwSeed 확정 중단, 다음 로드에 재시도. 실패 키:',
+      specs.filter(([key]) => !results.get(key).ok).map(([key]) => key).join(', '));
+    return;
+  }
+  const added = specs.reduce((n, [key]) => n + results.get(key).added, 0);
+  // 2초 디바운스 push를 기다리지 않고 지금 즉시 PUT하고 결과를 확인한다(서버 모드 전용 —
+  // 위의 isServerMode() 가드로 로컬 모드에서는 여기까지 오지 않음).
+  // push가 전부 성공(r.ok)했을 때만 gwSeed 버전을 확정 — 실패 시 미기록으로 남겨
+  // 다음 로드에서 자동으로 재시도한다(이전엔 push 결과와 무관하게 확정되어, 전송 실패 시
+  // 서버에 샘플이 영영 반영되지 않는 고착 문제가 있었다).
+  const r = await gateway.pushSharedNow(['mcps', 'strategies', 'benchmarks']);
+  if (!r.ok) {
+    console.warn('[syncSamplesToGateway] 샘플 서버 push 실패 — 다음 로드에 재시도. 실패 키:', r.failed.join(', ') || '(없음)');
+    toast('기본 샘플의 서버 반영에 실패했습니다. 다음 접속 시 자동으로 다시 시도합니다.', 'warn', 6000);
+    return;
   }
   store.set(gateKey, SAMPLE_VERSION);
   if (added > 0) toast(`새 기본 샘플 ${added}개를 서버에 반영했습니다. 다른 기기는 새로고침하면 보입니다.`, 'success', 6000);

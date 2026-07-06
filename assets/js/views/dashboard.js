@@ -50,11 +50,14 @@ export async function render(container) {
     sysBody.replaceChildren(...rows);
   })();
 
-  // 카테고리 분포 도넛
+  // 카테고리 분포 도넛 — 상위 8개 + 나머지는 '기타'로 합산해 조각 합계가 전체 MCP 수와 일치하도록
   const catCount = {};
   for (const m of mcps) catCount[m.category] = (catCount[m.category] || 0) + 1;
-  const catItems = Object.entries(catCount).sort((a, b) => b[1] - a[1]).slice(0, 8)
-    .map(([label, value]) => ({ label, value }));
+  const catSorted = Object.entries(catCount).sort((a, b) => b[1] - a[1]);
+  const catItems = catSorted.slice(0, 8).map(([label, value]) => ({ label, value }));
+  const etcSum = catSorted.slice(8).reduce((s, [, v]) => s + v, 0);
+  // '기타' 색은 명시 지정 — SERIES_COLORS가 8색 순환이라 9번째 조각이 첫 조각 색과 겹치는 것을 방지
+  if (etcSum > 0) catItems.push({ label: '기타', value: etcSum, color: '#64748b' });
 
   // 최근 평가 실행
   const recentRuns = runs.slice(0, 5);

@@ -26,6 +26,7 @@ import { BENCH_PASSENGER } from './benchmarksExt/passenger.js';
 import { BENCH_WEATHER } from './benchmarksExt/weather.js';
 import { BENCH_ANALYTICS } from './benchmarksExt/analytics.js';
 import { BENCH_FARE } from './benchmarksExt/fare.js';
+import { BENCH_COMPLEX } from './benchmarksExt/complex.js';
 
 export const SAMPLE_STRATEGIES = [
   // --------------------------------------------------------------------------
@@ -554,9 +555,10 @@ const BASE_BENCHMARKS = [
   }
 ];
 
-// ── v2: 기본 검증 세트 1종 + 분야별 검증 세트 10종 = 총 11세트 병합 ──
+// ── v2: 기본 1종 + 분야별 10종 + 복합 시나리오 1종 = 총 12세트 병합 ──
 export const SAMPLE_BENCHMARKS = [
   ...BASE_BENCHMARKS,
   BENCH_OPERATIONS, BENCH_BOOKING, BENCH_SAFETY, BENCH_FACILITY, BENCH_FREIGHT,
   BENCH_URBAN, BENCH_PASSENGER, BENCH_WEATHER, BENCH_ANALYTICS, BENCH_FARE,
+  BENCH_COMPLEX,
 ];

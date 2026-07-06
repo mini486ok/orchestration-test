@@ -349,9 +349,15 @@ export async function render(container) {
   }
 
   /* ---------- 툴바 ---------- */
+  // 검색 입력 120ms 디바운스 — 타이핑 중 키 입력마다 100장 카드 그리드를 재렌더하지 않도록
+  let searchTimer = null;
   const searchInput = el('input', {
     class: 'input', type: 'search', placeholder: '이름·설명·태그·도구명 검색…',
-    oninput: (e) => { search = e.target.value.trim().toLowerCase(); renderGrid(); },
+    oninput: (e) => {
+      const v = e.target.value.trim().toLowerCase();
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => { search = v; renderGrid(); }, 120);
+    },
   });
   const sortSelect = el('select', {
     class: 'select', style: { width: 'auto' },
@@ -376,5 +382,5 @@ export async function render(container) {
   renderGrid();
 
   const unsub = store.subscribe('mcps', () => renderGrid());
-  return () => { unsub(); closeDrawer(); };
+  return () => { unsub(); closeDrawer(); clearTimeout(searchTimer); }; // 뷰 해제 시 대기 중 디바운스 정리
 }

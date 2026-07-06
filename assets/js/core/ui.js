@@ -47,19 +47,28 @@ export function toast(message, type = 'info', ms = 3600) {
 }
 
 /* ---------- 모달 ---------- */
+// 열린 모달 스택 — 모달 위에 모달(예: 마법사 위 확인 다이얼로그)이 겹칠 때
+// Escape/배경클릭이 최상단 모달 하나만 닫도록 한다(이중 닫힘 방지).
+// 단일 모달일 때는 항상 자신이 최상단이므로 기존 동작과 완전히 동일하다.
+const modalStack = [];
+
 export function modal({ title, body, actions = [], wide = false, onClose }) {
   const root = document.getElementById('modal-root');
   const backdrop = el('div', { class: 'modal-backdrop' });
   let closed = false;
-  const escHandler = (e) => { if (e.key === 'Escape') close(); };
+  const stackToken = {}; // 이 모달 인스턴스의 스택 식별자(고유 객체)
+  const isTop = () => modalStack[modalStack.length - 1] === stackToken;
+  const escHandler = (e) => { if (e.key === 'Escape' && isTop()) close(); };
   const close = () => {
     if (closed) return;           // 멱등: 중복 호출 무시
     closed = true;
+    const idx = modalStack.indexOf(stackToken);           // 닫힐 때 스택에서 제거(중간 위치여도 안전)
+    if (idx !== -1) modalStack.splice(idx, 1);
     document.removeEventListener('keydown', escHandler);  // 항상 리스너 제거(누수 방지)
     backdrop.remove();
     onClose?.();
   };
-  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) close(); });
+  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop && isTop()) close(); });
 
   const foot = actions.length ? el('div', { class: 'modal-foot' },
     actions.map(a => el('button', {
@@ -79,6 +88,7 @@ export function modal({ title, body, actions = [], wide = false, onClose }) {
   backdrop.appendChild(box);
   root.appendChild(backdrop);
 
+  modalStack.push(stackToken); // 등록 — 이 시점부터 최상단 모달
   document.addEventListener('keydown', escHandler);
   return { close, box };
 }
@@ -98,10 +108,13 @@ export function confirmDialog(message, { title = '확인', danger = true, okLabe
 }
 
 /* ---------- 뱃지/칩/기타 ---------- */
-const CATEGORY_COLORS = {
+// 카테고리 → 뱃지 색 키 매핑. 유효 키는 main.css의 .badge.* 클래스(green/amber/red/blue/violet/dim)뿐.
+// '복합'(여러 카테고리에 걸친 복합 시나리오)은 유일 사용 색이던 red(안전·관제 전용)를 피하고,
+// 스펙 예시대로 violet 톤을 사용한다(팔레트가 5색뿐이라 일부 카테고리 간 재사용은 불가피).
+export const CATEGORY_COLORS = {
   '운행정보': 'green', '예매·발권': 'blue', '안전·관제': 'red', '시설·유지보수': 'amber',
   '물류·화물': 'violet', '도시교통': 'blue', '여객서비스': 'green', '기상·환경': 'amber',
-  '데이터분석': 'violet', '요금·정산': 'blue',
+  '데이터분석': 'violet', '요금·정산': 'blue', '복합': 'violet',
 };
 export function badge(text, kind) {
   const k = kind || CATEGORY_COLORS[text] || 'dim';

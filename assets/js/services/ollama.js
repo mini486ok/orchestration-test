@@ -18,6 +18,62 @@ export function getNumCtx() {
   return Number(s.numCtx) > 0 ? Number(s.numCtx) : 16384;
 }
 
+/** LLM 호출당 타임아웃(초). 기본 300, 0=무제한. 미설정(구버전 settings)·비정상 값은 기본값으로 방어. */
+export function getLlmTimeoutSec() {
+  const s = store.get('settings') || {};
+  const v = Number(s.llmTimeoutSec);
+  if (!Number.isFinite(v) || v < 0) return 300;
+  return v; // 0 = 무제한
+}
+
+/**
+ * LLM 호출당 타임아웃 시그널 생성 — 기존 signal(사용자 중단)과 타임아웃을 결합한다.
+ * - AbortSignal.any 지원 시 이를 사용, 미지원 브라우저는 수동 리스너 결합으로 폴백.
+ * - llmTimeoutSec=0(무제한)이면 기존 signal을 그대로 통과시켜 기존 동작과 동일.
+ * 반환: { signal, done(), mapAbort(e) }
+ *   done(): 호출 완료 후 타이머·폴백 abort 리스너 정리(finally에서 반드시 호출).
+ *   mapAbort(e): AbortError가 타임아웃에 의한 것이면 한국어 타임아웃 오류(name='TimeoutError')로 변환해
+ *   반환(사용자 중단 AbortError와 구분 — 상위 로직이 일반 오류로 집계), 아니면 원본 그대로 반환.
+ */
+function createLlmTimeout(signal) {
+  const sec = getLlmTimeoutSec();
+  if (!(sec > 0)) return { signal, done() { /* 없음 */ }, mapAbort: (e) => e };
+
+  const timeoutCtrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; timeoutCtrl.abort(); }, sec * 1000);
+
+  let combined;
+  let removeAbortListener = null; // 폴백 경로에서 외부 signal에 등록한 리스너 해제용(장수명 signal 누수 방지)
+  if (!signal) {
+    combined = timeoutCtrl.signal;
+  } else if (typeof AbortSignal.any === 'function') {
+    combined = AbortSignal.any([signal, timeoutCtrl.signal]);
+  } else {
+    // AbortSignal.any 미지원 폴백: 두 시그널을 수동 리스너로 하나의 컨트롤러에 결합
+    const ctrl = new AbortController();
+    const onAbort = () => { try { ctrl.abort(); } catch { /* 무시 */ } };
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener('abort', onAbort, { once: true });
+      removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+    }
+    timeoutCtrl.signal.addEventListener('abort', onAbort, { once: true });
+    combined = ctrl.signal;
+  }
+  return {
+    signal: combined,
+    done() { clearTimeout(timer); removeAbortListener?.(); },
+    mapAbort(e) {
+      // 사용자 중단이 먼저였으면(경합 시 우선) 원본 AbortError 유지 — 중단 의미 보존
+      if (signal?.aborted || !timedOut) return e;
+      const err = new Error(`LLM 응답 시간 초과(${sec}초) — 모델 응답이 너무 오래 걸립니다. 설정의 "LLM 응답 타임아웃"에서 조정하세요(0=무제한).`);
+      err.name = 'TimeoutError';
+      return err;
+    },
+  };
+}
+
 /**
  * 로컬/사설망 대상 fetch 래퍼 — https 공개 페이지에서 사설 IP·localhost로 요청할 때
  * Chrome의 Local Network Access를 위해 targetAddressSpace 값을 순차 시도한다.
@@ -162,68 +218,92 @@ export async function chat({ model, messages, temperature = 0.2, format, signal 
   // 서버 모드: 게이트웨이 /llm/chat 경유 (쿼터 소모, X-Quota-Remaining 헤더 반영)
   if (isServerMode()) return chatViaGateway(body, useModel, t0, signal);
 
-  let res;
+  // 호출당 타임아웃(설정 llmTimeoutSec, 기본 300초, 0=무제한)을 기존 signal과 결합
+  const tmo = createLlmTimeout(signal);
   try {
-    res = await fetchLNA(getOllamaUrl() + '/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    throw new Error(connectFailHint());
+    let res;
+    try {
+      res = await fetchLNA(getOllamaUrl() + '/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: tmo.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw tmo.mapAbort(e);
+      throw new Error(connectFailHint());
+    }
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+      throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
+    }
+    let data;
+    try { data = await res.json(); }
+    catch (e) {
+      // 응답 본문 수신 중의 타임아웃/중단도 동일하게 판별
+      if (e?.name === 'AbortError') throw tmo.mapAbort(e);
+      throw e;
+    }
+    const content = data.message?.content ?? '';
+    const tok = extractTokens(data, messages, content);
+    return {
+      content,
+      durationMs: performance.now() - t0,
+      model: useModel,
+      ...tok,
+    };
+  } finally {
+    tmo.done();
   }
-  if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
-    throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
-  }
-  const data = await res.json();
-  const content = data.message?.content ?? '';
-  const tok = extractTokens(data, messages, content);
-  return {
-    content,
-    durationMs: performance.now() - t0,
-    model: useModel,
-    ...tok,
-  };
 }
 
 // 서버 모드 chat — 게이트웨이 /llm/chat. 429 는 한도 소진 오류, X-Quota-Remaining 으로 쿼터 갱신.
 async function chatViaGateway(body, useModel, t0, signal) {
-  let res;
+  // 호출당 타임아웃(설정 llmTimeoutSec)을 기존 signal과 결합 — 로컬 모드 chat()과 동일 정책
+  const tmo = createLlmTimeout(signal);
   try {
-    res = await gwFetch('/llm/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    throw new Error('게이트웨이에 연결할 수 없습니다. 게이트웨이 주소와 서버 상태를 확인하세요.');
+    let res;
+    try {
+      res = await gwFetch('/llm/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: tmo.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw tmo.mapAbort(e);
+      throw new Error('게이트웨이에 연결할 수 없습니다. 게이트웨이 주소와 서버 상태를 확인하세요.');
+    }
+    const rem = res.headers.get('X-Quota-Remaining');
+    if (rem !== null) setQuotaRemaining(rem);
+    if (res.status === 429) {
+      throw new Error('오늘의 LLM 호출 한도를 모두 사용했습니다(남은 호출 0). 관리자에게 한도 상향을 요청하세요.');
+    }
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+      throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
+    }
+    let data;
+    try { data = await res.json(); }
+    catch (e) {
+      // 응답 본문 수신 중의 타임아웃/중단도 동일하게 판별
+      if (e?.name === 'AbortError') throw tmo.mapAbort(e);
+      throw e;
+    }
+    const content = data.message?.content ?? '';
+    // 게이트웨이는 Ollama 원본 JSON(prompt_eval_count/eval_count 포함)을 그대로 통과시킨다.
+    const tok = extractTokens(data, body?.messages, content);
+    return {
+      content,
+      durationMs: performance.now() - t0,
+      model: useModel,
+      ...tok,
+    };
+  } finally {
+    tmo.done();
   }
-  const rem = res.headers.get('X-Quota-Remaining');
-  if (rem !== null) setQuotaRemaining(rem);
-  if (res.status === 429) {
-    throw new Error('오늘의 LLM 호출 한도를 모두 사용했습니다(남은 호출 0). 관리자에게 한도 상향을 요청하세요.');
-  }
-  if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
-    throw new Error(`LLM 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''}`);
-  }
-  const data = await res.json();
-  const content = data.message?.content ?? '';
-  // 게이트웨이는 Ollama 원본 JSON(prompt_eval_count/eval_count 포함)을 그대로 통과시킨다.
-  const tok = extractTokens(data, body?.messages, content);
-  return {
-    content,
-    durationMs: performance.now() - t0,
-    model: useModel,
-    ...tok,
-  };
 }
 
 /**
@@ -235,48 +315,70 @@ export async function embed({ model = 'bge-m3:latest', input, signal } = {}) {
   // 서버 모드: 게이트웨이 /llm/embed 프록시 (쿼터 무소모)
   if (isServerMode()) return embedViaGateway({ model, input, signal });
 
-  let res;
+  // 호출당 타임아웃(설정 llmTimeoutSec)을 기존 signal과 결합 — chat()과 동일 정책
+  const tmo = createLlmTimeout(signal);
   try {
-    res = await fetchLNA(getOllamaUrl() + '/api/embed', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input }),
-      signal,
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    throw new Error(connectFailHint());
+    let res;
+    try {
+      res = await fetchLNA(getOllamaUrl() + '/api/embed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, input }),
+        signal: tmo.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw tmo.mapAbort(e);
+      throw new Error(connectFailHint());
+    }
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+      throw new Error(`임베딩 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''} — 임베딩 모델(${model}) 설치 여부를 확인하세요.`);
+    }
+    let data;
+    try { data = await res.json(); }
+    catch (e) {
+      if (e?.name === 'AbortError') throw tmo.mapAbort(e);
+      throw e;
+    }
+    return data.embeddings || [];
+  } finally {
+    tmo.done();
   }
-  if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
-    throw new Error(`임베딩 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''} — 임베딩 모델(${model}) 설치 여부를 확인하세요.`);
-  }
-  const data = await res.json();
-  return data.embeddings || [];
 }
 
 // 서버 모드 embed — 게이트웨이 /llm/embed
 async function embedViaGateway({ model, input, signal }) {
-  let res;
+  // 호출당 타임아웃(설정 llmTimeoutSec)을 기존 signal과 결합
+  const tmo = createLlmTimeout(signal);
   try {
-    res = await gwFetch('/llm/embed', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input }),
-      signal,
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    throw new Error('게이트웨이에 연결할 수 없습니다. 임베딩 요청을 보낼 수 없습니다.');
+    let res;
+    try {
+      res = await gwFetch('/llm/embed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, input }),
+        signal: tmo.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw tmo.mapAbort(e);
+      throw new Error('게이트웨이에 연결할 수 없습니다. 임베딩 요청을 보낼 수 없습니다.');
+    }
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
+      throw new Error(`임베딩 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''} — 임베딩 모델(${model}) 설치 여부를 확인하세요.`);
+    }
+    let data;
+    try { data = await res.json(); }
+    catch (e) {
+      if (e?.name === 'AbortError') throw tmo.mapAbort(e);
+      throw e;
+    }
+    return data.embeddings || [];
+  } finally {
+    tmo.done();
   }
-  if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.json())?.error || ''; } catch { /* 무시 */ }
-    throw new Error(`임베딩 호출 실패 (HTTP ${res.status})${detail ? ': ' + detail : ''} — 임베딩 모델(${model}) 설치 여부를 확인하세요.`);
-  }
-  const data = await res.json();
-  return data.embeddings || [];
 }
 
 // 한 후보 문자열에서 JSON을 추출: 전체 파싱 → 실패 시 모든 '{'/'[' 시작 위치를 순서대로 시도(최대 20개)

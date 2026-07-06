@@ -87,6 +87,16 @@ export function buildToolCatalog(mcps = []) {
   return lines.length > 1 ? lines.join('\n') : '(등록된 도구가 없습니다)';
 }
 
+/**
+ * 전체 카탈로그 프롬프트 텍스트의 추정 토큰 수 — buildToolCatalog 재사용, LLM 호출 없음(순수 함수).
+ * 한글 혼합 텍스트 기준 chars/2.2 근사(llmJSON의 컨텍스트 예산 추정과 동일 기준). 평가 preflight용.
+ * @param {Array} mcps MCP 서버 배열
+ * @returns {number} 추정 토큰 수
+ */
+export function estimateCatalogTokens(mcps) {
+  return Math.round(buildToolCatalog(mcps).length / 2.2);
+}
+
 /* ============================================================
    내부 유틸
    ============================================================ */
@@ -144,7 +154,9 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
   const date = new Date().toISOString().slice(0, 10);
   const catalog = buildToolCatalog(mcps);
   const byId = new Map((mcps || []).map(m => [m.id, m]));
-  const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false, inputTokens: 0, outputTokens: 0, tokensEstimated: false };
+  // ctxOverflow: 카탈로그 프롬프트가 num_ctx를 초과(추정/실측)해 잘렸을 가능성 — 점수 신뢰도 판단용.
+  // retrievalFallback: db 검색이 의도한 방식이 아닌 폴백으로 실행된 사유 문자열(없으면 null).
+  const result = { ok: true, steps: [], trace: [], llmCalls: 0, totalLatencyMs: 0, hasStepErrors: false, inputTokens: 0, outputTokens: 0, tokensEstimated: false, ctxOverflow: false, retrievalFallback: null };
   // react는 도구 오류를 관찰(observation)로 흘려보내 모델이 회복하도록 두므로 step 오류만으로 실패 처리하지 않는다.
   // prompt·db 모두 planningMode==='react'면 동일하게 처리(db도 프롬프트 실행 경로를 공유).
   const failOnStepError = !((strategy?.type === 'prompt' || strategy?.type === 'db') && cfg.planningMode === 'react');
@@ -175,15 +187,16 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
     },
     async llmJSON(messages, { temperature } = {}) {
       ctx.throwIfAborted();
-      // 컨텍스트 예산 경고 (실행당 1회): 한글 혼합 텍스트 기준 대략 chars/2.2 ≈ 토큰
-      if (!ctx._ctxWarned) {
-        const totalChars = messages.reduce((s, m) => s + (m.content?.length || 0), 0);
-        const estTokens = Math.round(totalChars / 2.2);
-        const numCtx = getNumCtx();
-        if (estTokens > numCtx * 0.9) {
-          ctx._ctxWarned = true;
-          emit('info', `⚠ 프롬프트 예상 토큰(~${estTokens.toLocaleString()})이 컨텍스트 길이(num_ctx=${numCtx.toLocaleString()})에 근접/초과합니다. 도구 카탈로그가 잘릴 수 있으니 설정에서 컨텍스트 길이를 상향하세요.`);
-        }
+      // 컨텍스트 예산 점검(호출마다 — react 대화 누적도 감지): 한글 혼합 텍스트 기준 대략 chars/2.2 ≈ 토큰
+      const totalChars = messages.reduce((s, m) => s + (m.content?.length || 0), 0);
+      const estTokens = Math.round(totalChars / 2.2);
+      const numCtx = getNumCtx();
+      // C2: 추정 토큰이 num_ctx를 초과하면 컨텍스트 초과 플래그 기록(프롬프트 절단 가능 — 점수 신뢰도 판단용)
+      if (estTokens > numCtx) result.ctxOverflow = true;
+      // 컨텍스트 예산 경고 trace는 실행당 1회(기존 동작 유지)
+      if (!ctx._ctxWarned && estTokens > numCtx * 0.9) {
+        ctx._ctxWarned = true;
+        emit('info', `⚠ 프롬프트 예상 토큰(~${estTokens.toLocaleString()})이 컨텍스트 길이(num_ctx=${numCtx.toLocaleString()})에 근접/초과합니다. 도구 카탈로그가 잘릴 수 있으니 설정에서 컨텍스트 길이를 상향하세요.`);
       }
       emit('llm-request', `LLM 요청 (${ctx.model})`, messagesPreview(messages));
       let res;
@@ -206,6 +219,9 @@ function createRunContext({ strategy, query, mcps, onTrace, signal }) {
       result.inputTokens += res.promptTokens || 0;
       result.outputTokens += res.outputTokens || 0;
       if (res.tokensEstimated) result.tokensEstimated = true;
+      // C2: 실측 promptTokens가 num_ctx의 98% 이상이면 프롬프트 절단(초과)을 사후 확정.
+      // 단, 형식 재요청(calls=2) 시 promptTokens는 두 호출의 합산이라 오탐하므로 단일 호출(calls===1)일 때만 판정.
+      if (!res.tokensEstimated && res.calls === 1 && (res.promptTokens || 0) >= numCtx * 0.98) result.ctxOverflow = true;
       emit('llm-response', `LLM 응답 (${Math.round(res.durationMs || 0)}ms)${res.retried ? ' · 형식 재요청됨' : ''}`, res.raw);
       return res.data;
     },
@@ -365,6 +381,14 @@ async function runSteps(ctx, steps, { paramFill = 'template' } = {}) {
    카탈로그 검색 기반 공급(retrieval)
    ============================================================ */
 
+/**
+ * C3: db 검색 폴백 사유를 결과에 기록 — 실행당 최초 1회(이미 기록돼 있으면 유지).
+ * 예: 'graph→vector(stale)', 'hybrid→keyword(인덱스가 없어 키워드 검색으로 대체)', '검색 0건→전체 카탈로그'
+ */
+function noteRetrievalFallback(ctx, reason) {
+  if (!ctx.result.retrievalFallback) ctx.result.retrievalFallback = String(reason);
+}
+
 /** 검색 결과 도구들만으로 축소 MCP 배열 구성(서버·도구 순서 보존) */
 function reduceMcps(mcps, results) {
   const wanted = new Map(); // serverId -> Set(toolName)
@@ -420,6 +444,8 @@ async function applyCatalogRetrieval(ctx, opts = {}) {
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
     ctx.result.totalLatencyMs += performance.now() - t0; // 임베딩 시도 지연도 총 지연에 포함
+    // C3: 검색 자체가 실패해 전체 카탈로그로 폴백
+    noteRetrievalFallback(ctx, `${method} 검색 실패→전체 카탈로그`);
     ctx.emit('error', `${label} 실패 — 전체 카탈로그로 폴백: ${e.message}`);
     return;
   }
@@ -427,8 +453,15 @@ async function applyCatalogRetrieval(ctx, opts = {}) {
 
   const results = res.results || [];
   if (!results.length) {
+    // C3: 검색 0건 → 전체 카탈로그 폴백(내부 방식 폴백이 함께 있었으면 사유에 병기)
+    noteRetrievalFallback(ctx, `검색 0건→전체 카탈로그${res.fallbackReason ? ` (${res.usedMethod}: ${res.fallbackReason})` : ''}`);
     ctx.emit('info', `⚠ ${label} 결과 0개 — 전체 카탈로그로 폴백합니다 (${res.usedMethod}${res.fallbackReason ? ', ' + res.fallbackReason : ''}).`);
     return;
+  }
+
+  // C3: 검색은 성공했지만 catalogIndex 내부에서 방식 폴백(vector/hybrid→keyword 등)이 일어난 경우 기록
+  if (res.fallbackReason) {
+    noteRetrievalFallback(ctx, `${res.requestedMethod || method}→${res.usedMethod}(${res.fallbackReason})`);
   }
 
   const reduced = reduceMcps(ctx.allMcps, results);
@@ -486,6 +519,8 @@ async function applyGraphRetrieval(ctx) {
   // 그래프 없음/stale → vector(또는 keyword) 폴백
   if (!status.exists || status.stale) {
     const why = !status.exists ? '그래프 db가 아직 구축되지 않음' : '그래프 db가 stale(MCP·벤치마크 변경됨)';
+    // C3: graph→vector 폴백 사유 기록(이후 vector 내부 폴백이 있어도 최초 사유 유지)
+    noteRetrievalFallback(ctx, `graph→vector(${!status.exists ? '미구축' : 'stale'})`);
     ctx.emit('info', `⚠ ${why} — vector 검색으로 폴백합니다. 그래프 편집기에서 그래프를 구축/재구축하세요.`);
     await graphVectorFallback('DB 검색(graph→vector 폴백)');
     return;
@@ -539,6 +574,7 @@ async function applyGraphRetrieval(ctx) {
     if (e?.name === 'AbortError') throw e;
     ctx.result.totalLatencyMs += performance.now() - t0;
     // 그래프 검색 예외 → 전체 카탈로그가 아니라 vector(→keyword) 검색으로 폴백(축소효과 유지, E4).
+    noteRetrievalFallback(ctx, 'graph 실패→vector'); // C3
     ctx.emit('error', `DB 검색(graph) 실패 — vector 검색으로 폴백합니다: ${e.message}`);
     await graphVectorFallback('DB 검색(graph 실패→vector 폴백)');
     return;
@@ -547,9 +583,14 @@ async function applyGraphRetrieval(ctx) {
 
   const results = res.results || [];
   if (!results.length) {
+    // C3: graph 검색 0건 → 전체 카탈로그 폴백
+    noteRetrievalFallback(ctx, `graph 검색 0건→전체 카탈로그${res.fallbackReason ? ` (${res.fallbackReason})` : ''}`);
     ctx.emit('info', `⚠ DB 검색(graph) 결과 0개 — 전체 카탈로그로 폴백합니다${res.fallbackReason ? ' (' + res.fallbackReason + ')' : ''}.`);
     return;
   }
+
+  // C3: 검색은 성공했지만 내부 폴백 사유가 반환된 경우(시드 vector→keyword, 그래프/유효 엣지 없음 등) 기록
+  if (res.fallbackReason) noteRetrievalFallback(ctx, `graph: ${res.fallbackReason}`);
 
   // 경로 추천(recommendPaths) 반영: graphRetrieve 후보에 추천 워크플로우 경로의 도구를 합집합으로 보강한다.
   // 실패/예외/빈 결과는 무시하고 기존 graphRetrieve 후보만 사용(회귀 없음). AbortError만 전파.

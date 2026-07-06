@@ -7,7 +7,12 @@ import {
 } from '../core/ui.js';
 import { groupedBarChart, radarChart, hBarChart, SERIES_COLORS } from '../core/charts.js';
 import { runEvaluation } from '../services/evaluator.js';
-import { checkConnection, listModels } from '../services/ollama.js';
+import { checkConnection, listModels, getNumCtx, getDefaultModel } from '../services/ollama.js';
+// 사전 점검(preflight)용 — estimateCatalogTokens는 구버전 orchestrator에 없을 수 있어
+// 네임스페이스 import 후 존재 여부를 가드한다(부재 시 해당 점검만 조용히 스킵).
+import * as orchestratorMod from '../services/orchestrator.js';
+import { indexStatus } from '../services/catalogIndex.js';
+import { graphStatus } from '../services/catalogGraph.js';
 
 /* ---------- 공통 헬퍼 ---------- */
 const TYPE_LABEL = { prompt: '프롬프트', skill: '스킬', rule: '룰', db: 'DB' };
@@ -129,6 +134,16 @@ const METRIC_INFO = {
     meaning: '부분 오류까지 포함한 실패 비율. react류는 단계 오류에서 회복할 수 있어 실행 실패율과 함께 봐야 합니다.',
     formula: '오류가 있었던 문항(단계 포함) / 전체 문항',
   },
+  ctxOverflowCount: {
+    name: '컨텍스트 초과 문항 수(⚠ctx)', dir: 'down',
+    meaning: '프롬프트가 numCtx를 넘어 잘렸을 가능성이 있는 문항 수입니다. 카탈로그·컨텍스트가 잘린 채 실행되므로 해당 전략의 점수는 신뢰할 수 없습니다. numCtx 상향 또는 DB(검색) 전략 사용을 권장합니다.',
+    formula: 'ctxOverflow=true 문항 수 (프롬프트 전체 추정(chars/2.2) > numCtx 또는 실측 promptTokens ≥ numCtx×0.98)',
+  },
+  retrievalFallbackCount: {
+    name: '검색 폴백 문항 수(⚠폴백)', dir: 'down',
+    meaning: 'DB 전략이 의도한 검색이 아닌 폴백으로 실행된 문항 수입니다(예: graph→vector, vector→keyword, 검색 0건→전체 카탈로그). 전략 설계 의도와 다른 조건에서 측정된 점수임을 뜻합니다.',
+    formula: 'retrievalFallback ≠ null 문항 수',
+  },
 };
 
 /** 방향 설명 텍스트 */
@@ -180,6 +195,15 @@ function injectEvalStyles() {
 .eval-glossary .gl-dir { display: inline-block; font-size: 11px; font-weight: 600; margin-top: 7px; }
 .eval-glossary .gl-dir.up { color: var(--sig-green); }
 .eval-glossary .gl-dir.down { color: var(--sig-amber); }
+/* 사전 점검(preflight) 패널 — 비차단 amber 경고 */
+.eval-preflight { margin-top: 12px; display: flex; gap: 10px; align-items: flex-start; background: var(--sig-amber-dim); border: 1px solid rgba(244,182,63,.28); border-radius: var(--r2); padding: 12px 14px; font-size: 12.5px; color: var(--tx1); line-height: 1.55; }
+.eval-preflight .pf-title { font-weight: 600; color: var(--tx0); }
+.eval-preflight ul { margin: 5px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.eval-preflight li::marker { color: var(--sig-amber); }
+/* 항목별 상세 필터 바 */
+.eval-detail-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.eval-detail-filters .select, .eval-detail-filters .input { width: auto; }
+.eval-detail-filters .df-count { font-size: 11.5px; color: var(--tx2); font-family: var(--font-mono); }
 `;
   document.head.appendChild(style);
 }
@@ -324,6 +348,18 @@ export async function render(container, ctx) {
     const tempNum = el('input', { class: 'input', type: 'number', min: '0', max: '1', step: '0.1', value: '0.1', disabled: true, style: { width: '92px' } });
     const tempChk = el('input', { type: 'checkbox', onchange: (e) => { tempNum.disabled = !e.target.checked; } });
 
+    // maxSteps 통일 컨트롤 — 모델/온도 통일과 동일 패턴(비우면 전략별 설정 사용)
+    const stepsNum = el('input', {
+      class: 'input', type: 'number', min: '1', max: '20', step: '1',
+      placeholder: '전략별 설정', style: { width: '110px' },
+      oninput: () => renderPreflight(),
+    });
+    /** maxSteps 통일값 — 유한 양수(1~20)만 유효, 비우면 null(전략별 설정) */
+    function maxStepsVal() {
+      const v = Math.floor(Number(stepsNum.value));
+      return (stepsNum.value !== '' && Number.isFinite(v) && v > 0) ? Math.min(v, 20) : null;
+    }
+
     /* 선택된 세트의 무결성 경고(미등록 서버/도구 참조 개수) */
     const warnBox = el('div', {});
     function countIntegrityIssues(set) {
@@ -351,6 +387,85 @@ export async function render(container, ctx) {
         el('div', {}, `이 세트의 ${bad}개 항목이 삭제된 MCP(미등록 서버/도구)를 참조합니다 — 채점이 왜곡될 수 있습니다.`)));
     }
 
+    /* ---------- 사전 점검(preflight) — 비차단 amber 경고, 실패는 조용히 무시 ---------- */
+    const preflightBox = el('div', {});
+
+    /** 전체 카탈로그를 프롬프트에 주입하는 전략인지 (프롬프트 full/스킬/룰 LLM 폴백) */
+    function isFullCatalogStrategy(s) {
+      if (!s) return false;
+      if (s.type === 'prompt') return s.config?.catalogMode !== 'retrieval';
+      if (s.type === 'skill') return true;
+      if (s.type === 'rule') return s.config?.onNoMatch === 'llmFallback';
+      return false; // db는 검색으로 축소 카탈로그 구성
+    }
+
+    /** 선택된 세트·전략 기준 경고 문자열 배열 계산 — LLM 호출 없음, 각 점검은 개별 try/catch */
+    function computePreflight(set, chosen) {
+      const warns = [];
+      // (1) 전체 카탈로그 주입 전략: 카탈로그 추정 토큰 vs numCtx
+      try {
+        const fullCat = chosen.filter(isFullCatalogStrategy);
+        if (fullCat.length && typeof orchestratorMod.estimateCatalogTokens === 'function') {
+          const est = orchestratorMod.estimateCatalogTokens(mcps);
+          const numCtx = getNumCtx();
+          if (Number.isFinite(est) && Number.isFinite(numCtx) && est > numCtx) {
+            warns.push(`카탈로그 ≈${Math.round(est).toLocaleString('ko-KR')} tokens > numCtx ${numCtx.toLocaleString('ko-KR')} — 프롬프트가 잘려 결과가 오염될 수 있습니다. 설정에서 numCtx 상향 또는 DB(검색) 전략을 권장합니다. (해당 전략: ${fullCat.map((s) => s.name).join(', ')})`);
+          }
+        }
+      } catch { /* 조용히 무시 */ }
+      // (2) db 전략: 인덱스/그래프 구축 상태
+      for (const s of chosen) {
+        if (s.type !== 'db') continue;
+        try {
+          const cfg = s.config || {};
+          if (cfg.store === 'graph') {
+            const g = cfg.graph || {};
+            // 런타임(orchestrator.js)과 동일 규칙: extractModel 미지정 시 기본 모델(settings.defaultModel, 폴백 'exaone3.5:7.8b')
+            // — llm 엣지 사용 그래프의 추출 모델 변경도 preflight에서 동일하게 stale 판정.
+            const st = graphStatus(mcps, store.get('benchmarks') || [], g.embedModel || undefined, g.extractModel || getDefaultModel(),
+              { wantSemantic: !!g.edges?.semantic?.on, wantLlm: !!g.edges?.llm?.on });
+            if (!st.exists || st.stale) warns.push(`'${s.name}': 그래프 db ${!st.exists ? '미구축' : '오래됨(stale)'} — vector(→keyword) 폴백으로 평가됩니다. 그래프 편집기에서 구축/재구축하세요.`);
+          } else {
+            const v = cfg.vector || {};
+            if ((v.method || 'hybrid') !== 'keyword') { // keyword 전용 검색은 인덱스 불필요 — 점검 제외
+              // 실행 시 retrieve와 동일 기준: 기본 임베딩 모델(bge-m3)로 지문 비교 → 모델 불일치도 stale로 감지
+              const st = indexStatus(mcps, v.embedModel || 'bge-m3:latest', v.docFields);
+              if (!st.exists || st.stale) warns.push(`'${s.name}': 임베딩 인덱스 ${!st.exists ? '미구축' : '오래됨(stale)'} — keyword 폴백으로 평가됩니다. DB 편집기에서 색인을 구축/재구축하세요.`);
+            }
+          }
+        } catch { /* 조용히 무시 */ }
+      }
+      // (3) react 계열: 세트 최대 기대 단계+1 vs maxSteps(통일값 우선, final_answer 1단계 여유 필요)
+      try {
+        const maxExpected = (set?.items || []).reduce((m, it) => Math.max(m, (it.expected || []).length), 0);
+        const need = maxExpected + 1;
+        const uni = maxStepsVal();
+        for (const s of chosen) {
+          const cfg = s.config || {};
+          const isReact = (s.type === 'prompt' || s.type === 'db') && cfg.planningMode === 'react';
+          if (!isReact) continue;
+          const cfgSteps = Math.floor(Number(cfg.maxSteps));
+          const eff = Math.min(uni != null ? uni : (Number.isFinite(cfgSteps) && cfgSteps > 0 ? cfgSteps : 6), 20);
+          if (need > eff) warns.push(`'${s.name}': 최대 ${maxExpected}단계 문항에 maxSteps ${eff} — 여유 부족(권장 ≥ ${need}). react는 마지막 final_answer에 1단계가 더 필요합니다.`);
+        }
+      } catch { /* 조용히 무시 */ }
+      return warns;
+    }
+
+    function renderPreflight() {
+      try {
+        const set = benchmarks.find((b) => b.id === selectedSetId);
+        const chosen = sortedStrats.filter((s) => selectedStrategyIds.has(s.id));
+        const warns = (set && chosen.length) ? computePreflight(set, chosen) : [];
+        if (!warns.length) { preflightBox.replaceChildren(); return; }
+        preflightBox.replaceChildren(el('div', { class: 'eval-preflight' },
+          el('span', {}, '🔎'),
+          el('div', {},
+            el('div', { class: 'pf-title' }, `사전 점검 — 주의 ${warns.length}건 (실행은 가능합니다)`),
+            el('ul', {}, warns.map((w) => el('li', {}, w))))));
+      } catch { preflightBox.replaceChildren(); /* 점검 실패는 실행을 막지 않음 */ }
+    }
+
     const scaleHint = el('div', { class: 'hint' });
     function updateScale() {
       const set = benchmarks.find((b) => b.id === selectedSetId);
@@ -359,6 +474,7 @@ export async function render(container, ctx) {
       scaleHint.textContent = nStrat ? `예상 실행 규모: 항목 ${items}개 × 전략 ${nStrat}개 = 총 ${items * nStrat}회 실행` : '전략을 1개 이상 선택하세요.';
       startBtn.disabled = !(selectedSetId && nStrat);
       renderWarn();
+      renderPreflight();
     }
 
     const startBtn = el('button', { class: 'btn btn-primary btn-lg', disabled: true, onclick: onStart }, '▶ 평가 시작');
@@ -391,7 +507,8 @@ export async function render(container, ctx) {
         if (!Number.isFinite(t)) t = 0.1;
         temperature = Math.max(0, Math.min(1, t));
       }
-      startProgress({ benchmarkSet: set, strategies: chosen, model, temperature, name: nameInput.value.trim() || defaultRunName() });
+      const maxSteps = maxStepsVal(); // null이면 전략별 설정 사용
+      startProgress({ benchmarkSet: set, strategies: chosen, model, temperature, maxSteps, name: nameInput.value.trim() || defaultRunName() });
     }
 
     updateScale();
@@ -410,10 +527,15 @@ export async function render(container, ctx) {
         el('div', { class: 'fld' }, el('label', {}, '실행 이름'), nameInput),
         el('div', { class: 'fld' }, el('label', {}, '모델 오버라이드'), modelSelect,
           el('div', { class: 'hint' }, '선택 시 모든 전략에 강제 적용됩니다(공정 비교용). 기본은 각 전략에 지정된 모델을 따릅니다.'))),
-      el('div', { class: 'fld', style: { marginTop: '10px' } },
-        el('label', { class: 'row', style: { gap: '8px', alignItems: 'center', cursor: 'pointer' } },
-          tempChk, '온도 통일', tempNum),
-        el('div', { class: 'hint' }, '체크 시 모든 전략을 지정 온도(0~1, 기본 0.1)로 실행하여 무작위성을 통제합니다.')),
+      el('div', { class: 'grid cols-2', style: { marginTop: '10px' } },
+        el('div', { class: 'fld' },
+          el('label', { class: 'row', style: { gap: '8px', alignItems: 'center', cursor: 'pointer' } },
+            tempChk, '온도 통일', tempNum),
+          el('div', { class: 'hint' }, '체크 시 모든 전략을 지정 온도(0~1, 기본 0.1)로 실행하여 무작위성을 통제합니다.')),
+        el('div', { class: 'fld' },
+          el('label', { class: 'row', style: { gap: '8px', alignItems: 'center' } }, 'maxSteps 통일', stepsNum),
+          el('div', { class: 'hint' }, '지정 시(1~20) 프롬프트/DB 전략의 최대 실행 단계를 통일합니다(공정 비교용). 비우면 각 전략의 설정을 따릅니다.'))),
+      preflightBox,
       el('div', { class: 'row between', style: { marginTop: '6px', flexWrap: 'wrap', gap: '12px' } },
         scaleHint, startBtn));
 
@@ -465,7 +587,7 @@ export async function render(container, ctx) {
   /* ============================================================
      (B) 진행 중
      ============================================================ */
-  function startProgress({ benchmarkSet, strategies, model, temperature, name }) {
+  function startProgress({ benchmarkSet, strategies, model, temperature, maxSteps = null, name }) {
     const controller = new AbortController();
     const total = benchmarkSet.items.length;
     const totalUnits = total * strategies.length;
@@ -520,7 +642,7 @@ export async function render(container, ctx) {
     (async () => {
       let run;
       try {
-        run = await runEvaluation({ benchmarkSet, strategies, mcps, model, temperature, name, onProgress, signal: controller.signal });
+        run = await runEvaluation({ benchmarkSet, strategies, mcps, model, temperature, maxSteps, name, onProgress, signal: controller.signal });
       } catch (e) {
         clearInterval(timer);
         toast('평가 실행 중 오류: ' + (e?.message || e), 'error');
@@ -530,12 +652,16 @@ export async function render(container, ctx) {
       clearInterval(timer);
       toast(run.status === 'cancelled' ? '평가가 중단되었습니다. 부분 결과를 저장했습니다.' : '평가가 완료되었습니다.', run.status === 'cancelled' ? 'warn' : 'success');
 
-      // 저장: 최근 20개 유지, 실패(용량 초과) 시 10개로 절단해 1회 재시도
+      // 저장: 최근 20개 유지 → 실패(용량 초과) 시 10개 절단 재시도 → 최종 폴백으로 [run] 단독 1회 시도
       const existing = (store.get('runs') || []).filter((r) => r.id !== run.id);
       let saved = store.set('runs', [run, ...existing].slice(0, 20));
       if (!saved) saved = store.set('runs', [run, ...existing].slice(0, 10));
       if (!saved) {
-        toast('평가 결과 저장 실패 — 저장 공간 부족. 오래된 실행 기록을 삭제하세요.', 'error');
+        saved = store.set('runs', [run]); // 최종 폴백: 이번 결과만 단독 저장(이전 이력은 제거됨)
+        if (saved) toast('저장 공간 부족 — 이전 실행 이력을 비우고 이번 결과만 저장했습니다.', 'warn');
+      }
+      if (!saved) {
+        toast('평가 결과 저장 실패 — 저장 공간 부족. 오래된 실행 기록을 삭제하고, 이 결과는 화면의 ⬇ JSON 내보내기로 보존하세요.', 'error');
         container.replaceChildren(buildResults(run)); // 저장은 실패했어도 결과는 표시
         return;
       }
@@ -558,7 +684,7 @@ export async function render(container, ctx) {
             el('h2', { style: { fontSize: '18px', color: 'var(--tx0)' } }, run.name || run.benchmarkSetName),
             badge(STATUS_LABEL[run.status] || run.status, STATUS_KIND[run.status] || 'dim')),
           el('div', { class: 'hint', style: { marginTop: '4px' } },
-            `${run.benchmarkSetName || '-'} · ${fmt.date(run.createdAt)} · 전략 ${baseStrat.length}개${run.model ? ' · 모델 ' + run.model : ''}${run.temperature != null ? ' · 온도 통일 ' + run.temperature : ''}`)),
+            `${run.benchmarkSetName || '-'} · ${fmt.date(run.createdAt)} · 전략 ${baseStrat.length}개${run.model ? ' · 모델 ' + run.model : ''}${run.temperature != null ? ' · 온도 통일 ' + run.temperature : ''}${run.maxSteps != null ? ' · maxSteps 통일 ' + run.maxSteps : ''}`)),
         el('div', { class: 'row wrap', style: { gap: '8px' } },
           el('button', { class: 'btn btn-sm', onclick: () => exportJSON(run) }, '⬇ JSON'),
           el('button', { class: 'btn btn-sm', onclick: () => exportCSV(run) }, '⬇ CSV'),
@@ -635,7 +761,8 @@ export async function render(container, ctx) {
           section('순서 · 완전성', ['seqAccuracy', 'exactMatch']),
           section('파라미터 · 목표 달성', ['paramScore', 'goalAchieved', 'callSuccessRate', 'extraToolRate']),
           section('토큰 사용량', ['inputTokens', 'outputTokens', 'totalTokens']),
-          section('실행 비용 · 안정성', ['avgLatencyMs', 'avgLlmCalls', 'errorRate']))));
+          section('실행 비용 · 안정성', ['avgLatencyMs', 'avgLlmCalls', 'errorRate']),
+          section('결과 신뢰도 (리더보드 ⚠ 뱃지)', ['ctxOverflowCount', 'retrievalFallbackCount']))));
   }
 
   /* ---------- 인사이트 한 줄 ---------- */
@@ -700,12 +827,21 @@ export async function render(container, ctx) {
     const rows = strat.map((s, i) => {
       const m = s.summary;
       const isRuleFallback = s.strategyType === 'rule' && (m.fallbackRate || 0) > 0;
+      // 신뢰도 뱃지 — 신규 요약 키(ctxOverflowCount/retrievalFallbackCount)가 없는 구버전 run은 뱃지 없음
+      const ctxN = Number(m.ctxOverflowCount) || 0;
+      const rfN = Number(m.retrievalFallbackCount) || 0;
       const nameCell = el('td', {},
         el('div', { class: 'row', style: { gap: '7px', flexWrap: 'wrap', alignItems: 'center' } },
           el('b', { style: { color: 'var(--tx0)' } }, s.strategyName),
           typeBadge(s.strategyType),
           isRuleFallback
             ? el('span', { class: 'badge amber', title: '매치 실패 항목은 LLM 폴백으로 실행됨 — 룰 자체 성능과 분리 해석 필요' }, `폴백 ${fmt.pct(m.fallbackRate)}`)
+            : null,
+          ctxN > 0
+            ? el('span', { class: 'badge amber', title: `컨텍스트 초과 ${ctxN}문항 — 프롬프트가 numCtx를 넘어 잘렸을 가능성이 있습니다. 이 전략의 점수는 신뢰할 수 없습니다. numCtx 상향 또는 DB 전략을 권장합니다.` }, `⚠ctx ${ctxN}`)
+            : null,
+          rfN > 0
+            ? el('span', { class: 'badge amber', title: `검색 폴백 ${rfN}문항 — DB 전략이 의도한 검색(vector/graph)이 아닌 폴백 경로로 실행되었습니다. 전략 설계 의도와 다른 조건에서 측정된 점수입니다.` }, `⚠폴백 ${rfN}`)
             : null),
         (isRuleFallback && m.avgF1Matched != null)
           ? el('div', { class: 'hint', style: { marginTop: '3px', color: 'var(--tx2)' } }, `룰 매치 항목만 F1 ${fmt.pct(m.avgF1Matched)}`)
@@ -814,6 +950,32 @@ export async function render(container, ctx) {
         strat.length > 1 ? segmented(strat.map((s) => ({ label: s.strategyName, value: s.id })), selId, (v) => { selId = v; renderDiff(); }) : null),
       diffBox);
 
+    // (d-2) 카테고리별 F1 — 난이도별 F1과 동일 패턴(전략 세그먼트 전환). category 없는 구버전 run은 빈 안내.
+    const catBox = el('div', {});
+    let catSelId = strat[0].id;
+    function renderCat() {
+      const s = strat.find((x) => x.id === catSelId) || strat[0];
+      const byCat = new Map();
+      for (const it of (s.items || [])) {
+        if (!it.category) continue; // 카테고리 미기록(구버전 run) 항목은 스킵
+        if (!byCat.has(it.category)) byCat.set(it.category, []);
+        byCat.get(it.category).push(it.metrics?.f1 || 0);
+      }
+      const items = [...byCat.entries()]
+        .map(([label, arr]) => ({ label, value: arr.reduce((a, b) => a + b, 0) / arr.length }))
+        .sort((a, b) => b.value - a.value)
+        .map((x, i) => ({ ...x, color: SERIES_COLORS[i % SERIES_COLORS.length] }));
+      catBox.replaceChildren(items.length
+        ? hBarChart(items, { max: 1 })
+        : el('div', { class: 'hint', style: { color: 'var(--tx3)', padding: '20px', textAlign: 'center' } }, '카테고리 정보가 있는 항목이 없습니다.'));
+    }
+    renderCat();
+    const catCard = el('div', { class: 'card' },
+      el('div', { class: 'row between', style: { marginBottom: '12px', flexWrap: 'wrap', gap: '8px' } },
+        el('div', { class: 'panel-title', style: { margin: 0 } }, '카테고리별 F1'),
+        strat.length > 1 ? segmented(strat.map((s) => ({ label: s.strategyName, value: s.id })), catSelId, (v) => { catSelId = v; renderCat(); }) : null),
+      catBox);
+
     // (e) 전략별 토큰 사용량 (평균 입력/출력) — 토큰 데이터가 있을 때만
     const hasTokens = strat.some((s) => (s.summary.avgTotalTokens ?? 0) > 0
       || s.summary.avgInputTokens != null || s.summary.avgOutputTokens != null);
@@ -834,23 +996,53 @@ export async function render(container, ctx) {
     }
 
     return el('div', { class: 'grid cols-2', style: { marginBottom: '16px' } },
-      barCard, radarCard, latCard, diffCard, tokenCard);
+      barCard, radarCard, latCard, diffCard, catCard, tokenCard);
   }
 
   /* ---------- 항목별 상세 ---------- */
   function buildDetail(run, strat) {
     const tableBox = el('div', {});
     let selId = strat[0].id;
+    // 필터 상태 — 전략 전환 후에도 유지
+    let statusFilter = 'all'; // all | error | goalmiss
+    let diffFilter = 'all';   // all | easy | medium | hard
+    let searchText = '';
+
+    function applyFilters(items) {
+      const q = searchText.trim().toLowerCase();
+      return items.filter((it) => {
+        if (statusFilter === 'error' && !(it.error || it.hasStepErrors)) return false;
+        // 목표미달만: goalAchieved===0 (null=N/A는 미달 아님 — 제외)
+        if (statusFilter === 'goalmiss' && it.metrics?.goalAchieved !== 0) return false;
+        if (diffFilter !== 'all' && it.difficulty !== diffFilter) return false;
+        if (q && !String(it.query || '').toLowerCase().includes(q)) return false;
+        return true;
+      });
+    }
+
+    const countLabel = el('span', { class: 'df-count' });
 
     function renderTable() {
       const s = strat.find((x) => x.id === selId) || strat[0];
       const items = s.items || [];
-      if (!items.length) { tableBox.replaceChildren(el('div', { class: 'hint', style: { color: 'var(--tx3)' } }, '항목이 없습니다.')); return; }
+      if (!items.length) {
+        countLabel.textContent = '';
+        tableBox.replaceChildren(el('div', { class: 'hint', style: { color: 'var(--tx3)' } }, '항목이 없습니다.'));
+        return;
+      }
+      const visible = applyFilters(items);
+      countLabel.textContent = visible.length === items.length ? `${items.length}개` : `${visible.length} / ${items.length}개`;
+      if (!visible.length) {
+        tableBox.replaceChildren(el('div', { class: 'hint', style: { color: 'var(--tx3)', padding: '16px', textAlign: 'center' } }, '필터 조건에 맞는 항목이 없습니다.'));
+        return;
+      }
 
-      const rows = items.map((it) => {
+      const rows = visible.map((it) => {
         const { expMarks, actMarks } = diffMarks(it.expected || [], it.actual || []);
         return el('tr', { style: { cursor: 'pointer' }, onclick: () => openItemModal(s, it) },
           el('td', { style: { maxWidth: '260px' } }, el('div', { style: { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, it.query)),
+          // 카테고리 뱃지 — badge(text)는 CATEGORY_COLORS('복합' 포함) 매칭, 미등록 카테고리는 dim 폴백
+          el('td', {}, it.category ? badge(it.category) : el('span', { style: { color: 'var(--tx3)' } }, '-')),
           el('td', {}, workflowChips(it.expected || [], mcps, { marks: expMarks })),
           el('td', {}, (it.actual || []).length ? workflowChips(it.actual, mcps, { marks: actMarks }) : el('span', { class: 'hint', style: { color: 'var(--tx3)' } }, '(호출 없음)')),
           el('td', { class: 'num' }, fmt.pct(it.metrics?.f1)),
@@ -862,16 +1054,39 @@ export async function render(container, ctx) {
       tableBox.replaceChildren(el('div', { class: 'tbl-wrap' },
         el('table', { class: 'tbl' },
           el('thead', {}, el('tr', {},
-            el('th', {}, '질의'), el('th', {}, '기대 워크플로우'), el('th', {}, '실제 워크플로우'),
+            el('th', {}, '질의'), el('th', {}, '카테고리'),
+            el('th', {}, '기대 워크플로우'), el('th', {}, '실제 워크플로우'),
             el('th', {}, 'F1'), el('th', {}, '시퀀스'), el('th', {}, '지연'), el('th', {}, '상태'))),
           el('tbody', {}, rows))));
     }
     renderTable();
 
+    /* 필터 바 — 상태 토글 · 난이도 select · 질의 검색 */
+    const filterBar = el('div', { class: 'eval-detail-filters' },
+      segmented([
+        { label: '전체', value: 'all' },
+        { label: '오류만', value: 'error' },
+        { label: '목표미달만', value: 'goalmiss' },
+      ], statusFilter, (v) => { statusFilter = v; renderTable(); }),
+      el('select', {
+        class: 'select',
+        onchange: (e) => { diffFilter = e.target.value; renderTable(); },
+      },
+        el('option', { value: 'all' }, '난이도 전체'),
+        el('option', { value: 'easy' }, DIFF_LABEL.easy),
+        el('option', { value: 'medium' }, DIFF_LABEL.medium),
+        el('option', { value: 'hard' }, DIFF_LABEL.hard)),
+      el('input', {
+        class: 'input', type: 'search', placeholder: '질의 검색…', style: { minWidth: '160px' },
+        oninput: (e) => { searchText = e.target.value; renderTable(); },
+      }),
+      countLabel);
+
     return el('div', { class: 'card' },
       el('div', { class: 'row between', style: { marginBottom: '12px', flexWrap: 'wrap', gap: '8px' } },
         el('div', { class: 'panel-title', style: { margin: 0 } }, '항목별 상세', el('span', { class: 'sub' }, '행 클릭 시 실행 로그')),
         strat.length > 1 ? segmented(strat.map((s) => ({ label: s.strategyName, value: s.id })), selId, (v) => { selId = v; renderTable(); }) : null),
+      filterBar,
       el('div', { class: 'hint', style: { marginBottom: '10px' } },
         '워크플로우 표식: ', el('span', { style: { color: 'var(--sig-red)' } }, '● 누락'), ' · ', el('span', { style: { color: 'var(--sig-amber)' } }, '● 초과')),
       tableBox);
@@ -900,6 +1115,13 @@ export async function render(container, ctx) {
           : null,
         it.usedFallback ? badge('LLM 폴백', 'amber') : null,
         (it.hasStepErrors && !it.error) ? badge('부분 오류', 'amber') : null,
+        // 신뢰도 뱃지 — 리더보드 ⚠ 뱃지와 동일 의미(문항 단위), title에 사유 표기
+        it.metrics?.ctxOverflow === true
+          ? el('span', { class: 'badge amber', title: '프롬프트가 numCtx를 넘어 잘렸을 가능성(추정 또는 실측) — 이 문항의 점수는 신뢰할 수 없습니다. numCtx 상향 또는 DB 전략을 권장합니다.' }, '⚠ctx')
+          : null,
+        it.metrics?.retrievalFallback
+          ? el('span', { class: 'badge amber', title: String(it.metrics.retrievalFallback) }, '⚠폴백')
+          : null,
         badge(fmt.ms(it.latencyMs), 'dim'),
         badge(`LLM ${it.llmCalls || 0}`, 'violet')),
       el('div', { class: 'diff-cols', style: { marginBottom: '14px' } },

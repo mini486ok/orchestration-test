@@ -130,15 +130,15 @@ function isStepAchieved(target, actualSteps) {
 
 /**
  * 목표 도구 달성 여부(1/0/null). null = 판정 대상 없음(N/A).
- * 채택된 gold 시퀀스(adoptedGold: primary 또는 F1 최대로 채택된 대안)와 대안 채택 여부(isAlternative)로 목표 step 집합을 정한다.
+ * 채택된 gold 시퀀스(adoptedGold: primary 또는 F1 최대로 채택된 대안)로 목표 step 집합을 정한다.
  *   - ordered===false 이고 goal 미지정 → 집합 완수 모드: adoptedGold 전체가 목표(순서 무의미한 대칭 병렬을 대칭 채점, 모두 충족 시 1).
- *   - goal 유효 && (primary 채택 || goal 도구가 adoptedGold에 포함) → 목표=[goal].
- *   - 그 외(대안 채택인데 goal이 그 대안에 없음 등) → 목표=[adoptedGold의 마지막 step].
+ *   - goal 유효 && goal 도구가 adoptedGold에 포함 → 목표=[goal] (primary/대안 공통 — 채택 후보에 포함될 때만 goal 사용).
+ *   - 그 외(goal이 채택 gold에 없음 등) → 목표=[adoptedGold의 마지막 step].
  *   - 목표가 비면(=expected 없음) → null.
  * 각 목표 step 충족 조건: actual에 같은 도구 id 호출이 error 없이 존재 && (그 step에 params 있으면 paramMatch ≥ 0.5).
  * 집합 모드는 모든 목표 step 충족 시 1, 단일 모드는 그 step 충족 시 1, 아니면 0.
  */
-function computeGoalAchieved(goal, adoptedGold, actualSteps, { ordered = true, isAlternative = false } = {}) {
+function computeGoalAchieved(goal, adoptedGold, actualSteps, { ordered = true } = {}) {
   const gold = Array.isArray(adoptedGold) ? adoptedGold : [];
   const goalValid = goal && (goal.serverId || goal.toolName);
 
@@ -146,7 +146,7 @@ function computeGoalAchieved(goal, adoptedGold, actualSteps, { ordered = true, i
   let targets;
   if (ordered === false && !goalValid) {
     targets = gold; // 집합 완수 모드(순서 무의미한 대칭 병렬)
-  } else if (goalValid && (!isAlternative || gold.some((s) => toolId(s) === toolId(goal)))) {
+  } else if (goalValid && gold.some((s) => toolId(s) === toolId(goal))) {
     targets = [{ serverId: goal.serverId, toolName: goal.toolName, params: goal.params }];
   } else if (gold.length) {
     targets = [gold[gold.length - 1]];
@@ -165,6 +165,22 @@ function computeGoalAchieved(goal, adoptedGold, actualSteps, { ordered = true, i
 /* ============================================================
    §8 scoreItem / summarize
    ============================================================ */
+
+/**
+ * alternatives 항목 정규화 — 두 가지 형태를 모두 {steps, goal}로 통일.
+ *   - 기존 배열 형태: Array<step> → { steps, goal: null } (100% 하위호환)
+ *   - 신규 객체 형태: { steps: Array<step>, goal?: {serverId,toolName,params?} }
+ * goal은 serverId 또는 toolName이 있을 때만 유효로 보존. 그 외 형태는 null(무시).
+ */
+function normalizeAlternative(alt) {
+  if (Array.isArray(alt)) return { steps: alt, goal: null };
+  if (alt && typeof alt === 'object' && Array.isArray(alt.steps)) {
+    const g = alt.goal;
+    const goal = (g && typeof g === 'object' && (g.serverId || g.toolName)) ? g : null;
+    return { steps: alt.steps, goal };
+  }
+  return null;
+}
 
 /** 하나의 정답 후보에 대한 채점 (ordered=false면 순서 무관 지표 사용) */
 function scoreOne(exp, act, ordered) {
@@ -204,9 +220,11 @@ function scoreOne(exp, act, ordered) {
  * 단일 항목 채점.
  * @param {Array<{serverId,toolName,params?}>} expected 정답 워크플로우
  * @param {Array<{serverId,toolName,error?,...}>} actualSteps 실행 결과 steps(각 step의 error 포함)
- * @param {{ordered?:boolean, alternatives?:Array<Array>, goal?:{serverId,toolName,params?}}} [opts]
- *   ordered=false → 순서 무관 채점 · alternatives → 대안 정답들(각각 expected 형태) 중 f1 최대 채택
- *   goal → 목표 도구 명시(없으면 채택 gold 시퀀스로 결정, computeGoalAchieved 참조)
+ * @param {{ordered?:boolean, alternatives?:Array<Array|{steps:Array,goal?:object}>, goal?:{serverId,toolName,params?}}} [opts]
+ *   ordered=false → 순서 무관 채점 · alternatives → 대안 정답들 중 f1 최대 채택.
+ *   대안 항목은 배열(기존) 또는 {steps, goal?} 객체(신규) 형태 — matchedAlternative 인덱스 의미 불변.
+ *   goal → 목표 도구 명시. 목표 결정 우선순위: ①채택 대안의 goal(유효하고 그 대안 steps에 포함)
+ *   → ②item.goal(채택 후보에 포함 시) → ③기존 규칙(ordered:false&goal없음=집합완수 / 마지막 step).
  * @returns {{precision,recall,f1,seqAccuracy,exactMatch,paramScore,matchedAlternative,
  *   callSuccessRate,extraToolRate,goalAchieved,compositeScore}}
  *   goalAchieved 는 1/0/null(판정 대상 없음). compositeScore 는 null 지표를 제외하고 남은 가중치로 재정규화한 값.
@@ -220,25 +238,32 @@ export function scoreItem(expected = [], actualSteps = [], opts = {}) {
   let best = scoreOne(primary, act, ordered);
   best.matchedAlternative = null; // null = 본 정답(primary) 채택
   let adoptedGold = primary;      // 목표 달성 판정에 쓸 "채택된 gold 시퀀스"
+  let adoptedAltGoal = null;      // 채택된 대안의 자체 goal(객체 형태 대안만 보유)
 
   const alts = Array.isArray(opts.alternatives) ? opts.alternatives : [];
   alts.forEach((alt, idx) => {
-    if (!Array.isArray(alt) || alt.length === 0) return; // 빈 대안은 무시(실수로 넣은 빈 배열이 만점 되는 것 방지)
-    const cand = scoreOne(alt, act, ordered);
+    const norm = normalizeAlternative(alt); // 배열/객체 형태를 {steps, goal}로 정규화
+    if (!norm || norm.steps.length === 0) return; // 빈 대안은 무시(실수로 넣은 빈 배열이 만점 되는 것 방지)
+    const cand = scoreOne(norm.steps, act, ordered);
     if (cand.f1 > best.f1) {
       cand.matchedAlternative = idx;
       best = cand;
-      adoptedGold = alt;
+      adoptedGold = norm.steps;
+      adoptedAltGoal = norm.goal;
     }
   });
 
   // §6 신규 지표 — 채택된(F1 최대) 후보 기준으로 일관되게 계산(대안 채택 시 그 대안 기준)
   best.callSuccessRate = computeCallSuccessRate(act);
   best.extraToolRate = act.length === 0 ? 0 : (1 - best.precision); // 잉여 도구 호출 비율(=1-정밀도)
-  best.goalAchieved = computeGoalAchieved(opts.goal, adoptedGold, act, {
-    ordered,
-    isAlternative: best.matchedAlternative != null,
-  });
+  // 목표 결정 우선순위: ①채택 대안의 goal(유효하고 그 대안 steps에 포함) → ②item.goal(채택 후보에
+  // 포함 시 — computeGoalAchieved 내부 규칙) → ③기존 규칙(집합완수/마지막 step).
+  let effectiveGoal = opts.goal;
+  if (best.matchedAlternative != null && adoptedAltGoal
+      && adoptedGold.some((s) => toolId(s) === toolId(adoptedAltGoal))) {
+    effectiveGoal = adoptedAltGoal;
+  }
+  best.goalAchieved = computeGoalAchieved(effectiveGoal, adoptedGold, act, { ordered });
   // 품질 종합점수(토큰 무관, [0,1]): f1 0.4 · 목표달성 0.3 · 도구성공률 0.15 · 파라미터 0.15의 가중평균.
   // N/A(null) 항목은 제외하고 남은 가중치로 재정규화(무호출/N/A 편향 제거). f1은 항상 존재.
   const terms = [
@@ -272,6 +297,7 @@ export function summarize(items = []) {
       avgCallSuccessRate: null, avgExtraToolRate: 0, goalAchievementRate: null,
       avgInputTokens: 0, avgOutputTokens: 0, avgTotalTokens: 0, totalTokens: 0,
       anyTokensEstimated: false, avgComposite: 0,
+      ctxOverflowCount: 0, retrievalFallbackCount: 0,
     };
   }
   const mean = (fn) => items.reduce((s, it) => s + (Number(fn(it)) || 0), 0) / n;
@@ -322,6 +348,9 @@ export function summarize(items = []) {
     totalTokens: sum((it) => it.metrics?.totalTokens),
     anyTokensEstimated: items.some((it) => it.metrics && it.metrics.tokensEstimated),
     avgComposite: mean((it) => it.metrics?.compositeScore),
+    // 신뢰도 카운트: ctxOverflow=true 항목 수 / retrievalFallback 비null 항목 수
+    ctxOverflowCount: items.filter((it) => it.metrics && it.metrics.ctxOverflow).length,
+    retrievalFallbackCount: items.filter((it) => it.metrics && it.metrics.retrievalFallback != null).length,
   };
 }
 
@@ -377,15 +406,20 @@ function defaultRunName() {
  * @param {Array} o.mcps McpServer[]
  * @param {string|null} [o.model] 모델 오버라이드 — 주어지면 전략 model 유무와 무관하게 모든 전략에 강제 적용
  * @param {number|null} [o.temperature] 온도 통일 — 주어지면 모든 전략의 config.temperature를 이 값으로 강제
+ * @param {number|null} [o.maxSteps] maxSteps 통일 — 유한 양수이면 prompt/db 전략의 config.maxSteps를
+ *   실행용 클론에서 이 값으로 오버라이드(원본 전략 무변경). 미지정 시 기존 동작.
  * @param {string} [o.name] 실행 이름
  * @param {(p:object)=>void} [o.onProgress]
  * @param {AbortSignal} [o.signal]
  * @returns {Promise<object>} EvalRun
  */
-export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], model = null, temperature = null, name, onProgress, signal } = {}) {
+export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], model = null, temperature = null, maxSteps = null, name, onProgress, signal } = {}) {
   const items = benchmarkSet?.items || [];
   const total = items.length;
   const tempOverride = (temperature != null && Number.isFinite(Number(temperature))) ? Number(temperature) : null;
+  // maxSteps 통일: 유한 양수만 유효 — prompt/db 전략에만 적용(rule/skill은 단계 상한 개념이 다름)
+  const maxStepsOverride = (maxSteps != null && Number.isFinite(Number(maxSteps)) && Number(maxSteps) > 0)
+    ? Number(maxSteps) : null;
 
   const run = {
     id: newId(),
@@ -397,6 +431,7 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
     status: 'running',
     model: model || null,
     temperature: tempOverride,
+    maxSteps: maxStepsOverride,
     perStrategy: {},
   };
 
@@ -406,10 +441,14 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
     if (signal?.aborted) { cancelled = true; break; }
 
     // 오버라이드 적용: model이 주어지면 전략 model 유무와 무관하게 강제 교체,
-    // temperature가 주어지면 config.temperature 강제 통일(공정 비교용)
+    // temperature가 주어지면 config.temperature 강제 통일(공정 비교용),
+    // maxSteps가 주어지면 prompt/db 전략의 config.maxSteps 강제 통일(실행용 클론 — 원본 무변경)
     let effStrategy = strategy;
     if (model) effStrategy = { ...effStrategy, model };
     if (tempOverride != null) effStrategy = { ...effStrategy, config: { ...(effStrategy.config || {}), temperature: tempOverride } };
+    if (maxStepsOverride != null && (strategy.type === 'prompt' || strategy.type === 'db')) {
+      effStrategy = { ...effStrategy, config: { ...(effStrategy.config || {}), maxSteps: maxStepsOverride } };
+    }
 
     const perItems = [];
     for (let i = 0; i < total; i++) {
@@ -421,6 +460,7 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
       let actual = [], trace = [], llmCalls = 0, latencyMs = 0, error, finalAnswer;
       let hasStepErrors = false, usedFallback = false;
       let inputTokens = 0, outputTokens = 0, tokensEstimated = false;
+      let ctxOverflow = false, retrievalFallback = null; // 신뢰도 플래그(res에 없으면 기본값 유지)
       try {
         const res = await executeStrategy(effStrategy, item.query, { mcps, signal });
         actual = res?.steps || [];
@@ -434,6 +474,9 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
         inputTokens = res?.inputTokens || 0;
         outputTokens = res?.outputTokens || 0;
         tokensEstimated = !!res?.tokensEstimated;
+        // 신뢰도 플래그: 컨텍스트 초과(카탈로그가 numCtx를 넘어 잘렸을 가능성)·검색 폴백 사유
+        ctxOverflow = !!res?.ctxOverflow;
+        retrievalFallback = res?.retrievalFallback ?? null;
         if (res && res.ok === false && res.error) error = res.error;
       } catch (e) {
         if (signal?.aborted || e?.name === 'AbortError') { cancelled = true; break; }
@@ -452,6 +495,9 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
       metrics.outputTokens = outputTokens;
       metrics.totalTokens = inputTokens + outputTokens;
       metrics.tokensEstimated = tokensEstimated;
+      // 신뢰도 플래그를 metrics에 기록(res에 필드가 없으면 false/null)
+      metrics.ctxOverflow = ctxOverflow;
+      metrics.retrievalFallback = retrievalFallback;
       perItems.push({
         itemId: item.id,
         query: item.query,
