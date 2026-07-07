@@ -18,7 +18,7 @@
 // 임베딩·llm 추출은 llmCalls로 집계하지 않는다(호출측이 지연만 반영).
 // ============================================================================
 import { store } from '../core/store.js';
-import { retrieve, indexStatus, INDEX_KEY } from './catalogIndex.js';
+import { retrieve, indexStatus, INDEX_KEY, docVec } from './catalogIndex.js';
 import { chatJSON, getDefaultModel } from './ollama.js';
 
 export const GRAPH_KEY = 'catalogGraph';
@@ -385,7 +385,8 @@ export async function buildGraph({
   const idx = store.get(INDEX_KEY);
   const idxHasVecs = idx && Array.isArray(idx.docs) && idx.docs.length;
   if (idxHasVecs) {
-    const vecByKey = new Map(idx.docs.map(d => [`${d.serverId}/${d.toolName}`, d.vec || []]));
+    // §I1: doc.vec은 구(float 배열)/신({q: base64(Int8), s: scale}) 포맷 공통으로 docVec()이 디코드한다.
+    const vecByKey = new Map(idx.docs.map(d => [`${d.serverId}/${d.toolName}`, docVec(d.vec)]));
     const nodeVecs = nodes.map(n => vecByKey.get(`${n.serverId}/${n.toolName}`) || null);
     if (nodeVecs.some(v => v && v.length)) {
       usedEmbed = true;

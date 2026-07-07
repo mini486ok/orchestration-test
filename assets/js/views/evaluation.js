@@ -6,7 +6,7 @@ import {
   emptyState, spinner, workflowChips,
 } from '../core/ui.js';
 import { groupedBarChart, radarChart, hBarChart, SERIES_COLORS } from '../core/charts.js';
-import { runEvaluation } from '../services/evaluator.js';
+import { runEvaluation, needsDiagnosis } from '../services/evaluator.js';
 import { checkConnection, listModels, getNumCtx, getDefaultModel } from '../services/ollama.js';
 // 사전 점검(preflight)용 — estimateCatalogTokens는 구버전 orchestrator에 없을 수 있어
 // 네임스페이스 import 후 존재 여부를 가드한다(부재 시 해당 점검만 조용히 스킵).
@@ -628,7 +628,11 @@ export async function render(container, ctx) {
 
   /* ---------- 실행 이력 ---------- */
   function buildHistory(runs) {
-    const card = el('div', { class: 'card' }, el('div', { class: 'panel-title' }, '실행 이력'));
+    // r9 §I3: 헤더에 저장 용량 힌트 — runs JSON 총량(문자 수 기준 ≈KB)
+    const sizeKB = runs.length ? Math.round(JSON.stringify(runs).length / 1024) : 0;
+    const card = el('div', { class: 'card' },
+      el('div', { class: 'panel-title' }, '실행 이력',
+        runs.length ? el('span', { class: 'sub' }, `이력 ${runs.length}개 · ≈${sizeKB.toLocaleString('ko-KR')} KB`) : null));
     if (!runs.length) {
       card.appendChild(el('div', { class: 'hint', style: { color: 'var(--tx3)' } }, '아직 평가 실행 기록이 없습니다.'));
       return card;
@@ -662,6 +666,55 @@ export async function render(container, ctx) {
           el('th', {}, '전략 수'), el('th', {}, '상태'), el('th', {}, '최고 F1'), el('th', {}, ''))),
         el('tbody', {}, rows))));
     return card;
+  }
+
+  /* ============================================================
+     r9 §I3 — 예산 기반 run 저장 + 자동 백업
+     ============================================================ */
+
+  /** 'runs' JSON 총량 예산(문자 수) — localStorage 총 한도(~5MB) 중 runs 몫 */
+  const RUNS_BUDGET = 1800000;
+
+  /**
+   * run 축소본(runLean) — 정상 문항(needsDiagnosis=false)의 trace 제거·finalAnswer 150자 절단.
+   * 진단 필요 문항과 모든 지표(metrics)·actual 스텝은 그대로 유지(채점·표시 무손실). 원본 무변경(깊은 복사).
+   */
+  function makeRunLean(run) {
+    const lean = JSON.parse(JSON.stringify(run));
+    for (const ps of Object.values(lean.perStrategy || {})) {
+      for (const it of ps.items || []) {
+        if (needsDiagnosis(it)) continue;
+        delete it.trace;
+        if (it.finalAnswer != null) it.finalAnswer = String(it.finalAnswer).slice(0, 150);
+      }
+    }
+    return lean;
+  }
+
+  /**
+   * 예산 기반 저장 — [run, ...existing]에서:
+   * 1) JSON 총량이 RUNS_BUDGET을 넘으면 오래된 run(배열 뒤쪽)부터 제거 반복
+   * 2) store.set 실패(실제 quota 초과) 시 추가 제거 반복 — 최소 [run] 단독까지
+   * 3) [run] 단독도 실패 → runLean(정상 문항 trace 제거·finalAnswer 150자)으로 재시도
+   * 4) 그래도 실패 → 원본 run JSON 자동 백업 다운로드(무음 유실 금지; 기존 이력은 그대로 남음)
+   * @returns {{saved:boolean, dropped:number, leaned:boolean, backedUp:boolean}}
+   */
+  function saveRunsWithBudget(run, existing) {
+    let list = [run, ...existing];
+    let dropped = 0;
+    while (list.length > 1 && JSON.stringify(list).length > RUNS_BUDGET) { list.pop(); dropped++; }
+    let saved = store.set('runs', list);
+    while (!saved && list.length > 1) { list.pop(); dropped++; saved = store.set('runs', list); }
+    let leaned = false;
+    if (!saved) { leaned = true; saved = store.set('runs', [makeRunLean(run)]); }
+    let backedUp = false;
+    if (!saved) {
+      backedUp = true;
+      const d = new Date(); const p = (v) => String(v).padStart(2, '0');
+      const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+      triggerDownload(new Blob([JSON.stringify(run, null, 2)], { type: 'application/json' }), `run-백업-${ts}.json`);
+    }
+    return { saved, dropped, leaned, backedUp };
   }
 
   /* ============================================================
@@ -732,18 +785,19 @@ export async function render(container, ctx) {
       clearInterval(timer);
       toast(run.status === 'cancelled' ? '평가가 중단되었습니다. 부분 결과를 저장했습니다.' : '평가가 완료되었습니다.', run.status === 'cancelled' ? 'warn' : 'success');
 
-      // 저장: 최근 20개 유지 → 실패(용량 초과) 시 10개 절단 재시도 → 최종 폴백으로 [run] 단독 1회 시도
+      // r9 §I3 저장: 예산(1.8M자) 기반 — 오래된 것부터 제거 → quota 실패 시 추가 제거 → [run] 단독
+      // → runLean(정상 문항 trace 제거) → 최종 자동 백업 다운로드. 제거/축소는 warn 토스트(무음 유실 금지).
       const existing = (store.get('runs') || []).filter((r) => r.id !== run.id);
-      let saved = store.set('runs', [run, ...existing].slice(0, 20));
-      if (!saved) saved = store.set('runs', [run, ...existing].slice(0, 10));
-      if (!saved) {
-        saved = store.set('runs', [run]); // 최종 폴백: 이번 결과만 단독 저장(이전 이력은 제거됨)
-        if (saved) toast('저장 공간 부족 — 이전 실행 이력을 비우고 이번 결과만 저장했습니다.', 'warn');
-      }
-      if (!saved) {
-        toast('평가 결과 저장 실패 — 저장 공간 부족. 오래된 실행 기록을 삭제하고, 이 결과는 화면의 ⬇ JSON 내보내기로 보존하세요.', 'error');
+      const saveRes = saveRunsWithBudget(run, existing);
+      if (!saveRes.saved) {
+        toast('자동 백업 파일로 저장했습니다 — 설정에서 저장 공간을 정리하세요.', 'error');
         container.replaceChildren(buildResults(run)); // 저장은 실패했어도 결과는 표시
         return;
+      }
+      if (saveRes.leaned) {
+        toast('저장 공간 부족 — 이전 이력을 제거하고 이번 결과를 축소본(정상 문항 로그 제거)으로 저장했습니다. 지표는 모두 유지됩니다.', 'warn');
+      } else if (saveRes.dropped > 0) {
+        toast(`저장 공간 확보를 위해 오래된 실행 이력 ${saveRes.dropped}개를 제거했습니다.`, 'warn');
       }
       router.navigate(`/evaluation/${run.id}`);
     })();

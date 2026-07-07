@@ -440,33 +440,52 @@ export function summarize(items = []) {
    저장 용량 보호용 절단
    ============================================================ */
 
-function truncateOutput(output) {
+// r9 §I2 적응 캡 — 진단 필요 문항은 현행 캡 유지, 정상(만점·무오류) 문항은 축소 캡 적용.
+// 반환 구조·키는 두 경우 모두 동일(값 절단만 다름) — 채점·표시 무손실.
+const CAPS_DIAG = { traceCount: 30, traceDetail: 500, finalAnswer: 800, stepOutput: 600 };
+const CAPS_LEAN = { traceCount: 8, traceDetail: 200, finalAnswer: 300, stepOutput: 250 };
+
+/**
+ * r9 §I2 — 진단 필요 문항 판정. 하나라도 해당하면 진단 캡(CAPS_DIAG)으로 원본을 최대 보존한다.
+ * 기준: error || hasStepErrors || usedFallback || metrics.retrievalFallback || metrics.ctxOverflow
+ *       || metrics.goalAchieved===0 || metrics.goalRetrieved===false || metrics.f1<1
+ * (저장된 perItems 항목 형태 그대로 받으므로 views의 runLean 축소 판정에도 재사용 — export)
+ */
+export function needsDiagnosis(it = {}) {
+  const m = it.metrics || {};
+  return !!(it.error || it.hasStepErrors || it.usedFallback
+    || m.retrievalFallback || m.ctxOverflow
+    || m.goalAchieved === 0 || m.goalRetrieved === false
+    || m.f1 < 1);
+}
+
+function truncateOutput(output, maxChars = CAPS_DIAG.stepOutput) {
   if (output == null) return output;
   try {
     const s = JSON.stringify(output);
-    if (s && s.length > 600) return { _truncated: true, preview: s.slice(0, 600) + '…' };
+    if (s && s.length > maxChars) return { _truncated: true, preview: s.slice(0, maxChars) + '…' };
     return output;
   } catch { return undefined; }
 }
 
-function truncateSteps(steps = []) {
+function truncateSteps(steps = [], caps = CAPS_DIAG) {
   return steps.map((s) => ({
     serverId: s.serverId,
     toolName: s.toolName,
     params: s.params,
-    output: truncateOutput(s.output),
+    output: truncateOutput(s.output, caps.stepOutput),
     latencyMs: s.latencyMs,
     error: s.error,
   }));
 }
 
-/** 항목당 trace는 마지막 30개 이벤트만, detail은 500자 절단 */
-function truncateTrace(trace = []) {
-  return trace.slice(-30).map((ev) => ({
+/** 항목당 trace는 마지막 caps.traceCount개 이벤트만, detail은 caps.traceDetail자 절단 (기본=진단 캡 30/500) */
+function truncateTrace(trace = [], caps = CAPS_DIAG) {
+  return trace.slice(-caps.traceCount).map((ev) => ({
     ts: ev.ts,
     type: ev.type,
     label: ev.label,
-    detail: ev.detail != null ? String(ev.detail).slice(0, 500) : undefined,
+    detail: ev.detail != null ? String(ev.detail).slice(0, caps.traceDetail) : undefined,
   }));
 }
 
@@ -684,21 +703,23 @@ export async function runEvaluation({ benchmarkSet, strategies = [], mcps = [], 
       metrics.suppliedToolCount = suppliedToolCount;
       // r8: 목표 도구가 검색 후보에 포함됐는지(true/false — null=retrievedTools 없음/goal 후보 없음)
       metrics.goalRetrieved = computeGoalRetrieved(retrievedTools, item.goal, item.expected || [], item.alternatives);
+      // r9 §I2: 진단 필요 문항은 현행 캡, 정상(만점·무오류) 문항은 축소 캡 — 구조·키 무변, 값 절단만
+      const caps = needsDiagnosis({ error, hasStepErrors, usedFallback, metrics }) ? CAPS_DIAG : CAPS_LEAN;
       perItems.push({
         itemId: item.id,
         query: item.query,
         difficulty: item.difficulty,
         category: item.category,
         expected: item.expected || [],
-        actual: truncateSteps(actual),
+        actual: truncateSteps(actual, caps),
         metrics,
         error,
         hasStepErrors,
         usedFallback,
         latencyMs,
         llmCalls,
-        trace: truncateTrace(trace),
-        finalAnswer: finalAnswer != null ? String(finalAnswer).slice(0, 800) : undefined,
+        trace: truncateTrace(trace, caps),
+        finalAnswer: finalAnswer != null ? String(finalAnswer).slice(0, caps.finalAnswer) : undefined,
       });
 
       onProgress?.({ strategyId: strategy.id, strategyName: strategy.name, itemIndex: i + 1, total, phase: 'done', query: item.query });

@@ -1,4 +1,4 @@
-// 설정 — Ollama 연결/모델, 중앙 게이트웨이(서버 모드), 계정 관리, 데이터 백업·복원·초기화
+// 설정 — Ollama 연결/모델, 중앙 게이트웨이(서버 모드), 계정 관리, 데이터 백업·복원·초기화, 저장 공간 사용량
 import { store } from '../core/store.js';
 import { auth } from '../core/auth.js';
 import { el, toast, field, badge, confirmDialog, modal, downloadJSON, pickJSONFile, fmt, spinner } from '../core/ui.js';
@@ -516,13 +516,103 @@ export async function render(container) {
     el('p', { class: 'hint', style: { marginTop: '12px', color: 'var(--sig-amber, #e0a326)' } },
       '⚠ "내보내기 (계정 포함)"은 비밀번호 해시가 담긴 계정 정보를 파일에 포함합니다. 파일이 유출되면 오프라인 대입 공격에 노출될 수 있으니 안전한 곳에만 보관하세요.'));
 
+  /* ---------- 저장 공간 사용량 ---------- */
+  // localStorage는 UTF-16으로 저장되므로 문자당 약 2바이트로 추정. 한도는 통상 ≈5MB이나 브라우저별로 다름.
+  const STORAGE_LIMIT_BYTES = 5 * 1024 * 1024;
+  const STORAGE_KEY_LABELS = [
+    ['catalogIndex', '벡터 인덱스'],
+    ['catalogGraph', '그래프 DB'],
+    ['runs', '평가 이력(runs)'],
+    ['mcps', 'MCP 카탈로그'],
+    ['benchmarks', '벤치마크'],
+    ['strategies', '전략'],
+  ];
+  const fmtSize = (bytes) => bytes >= 1024 * 1024
+    ? (bytes / 1024 / 1024).toFixed(2) + ' MB'
+    : (bytes / 1024).toFixed(1) + ' KB';
+
+  // rbtl: 프리픽스 키만 순회해 키별 추정 크기(바이트)를 수집
+  function collectStorageUsage() {
+    const map = new Map();
+    for (let i = 0; i < localStorage.length; i++) {
+      const full = localStorage.key(i);
+      if (!full || !full.startsWith('rbtl:')) continue;
+      let raw = '';
+      try { raw = localStorage.getItem(full) || ''; } catch { raw = ''; }
+      map.set(full.slice('rbtl:'.length), (full.length + raw.length) * 2);
+    }
+    return map;
+  }
+
+  const storageWrap = el('div', {});
+  function renderStorageUsage() {
+    const usage = collectStorageUsage();
+    const known = new Set(STORAGE_KEY_LABELS.map(([k]) => k));
+    let total = 0;
+    for (const b of usage.values()) total += b;
+    let etc = 0;
+    for (const [k, b] of usage) if (!known.has(k)) etc += b;
+    const pct = Math.min(100, (total / STORAGE_LIMIT_BYTES) * 100);
+    const level = pct >= 85 ? 'red' : pct >= 60 ? 'amber' : 'green';
+    const barColor = level === 'red' ? 'var(--sig-red)' : level === 'amber' ? 'var(--sig-amber, #e0a326)' : null;
+
+    const rows = STORAGE_KEY_LABELS
+      .map(([key, label]) => ({ key, label, bytes: usage.get(key) || 0 }))
+      .sort((a, b) => b.bytes - a.bytes);
+    if (etc > 0) rows.push({ key: null, label: '기타 (설정·계정 등)', bytes: etc });
+
+    storageWrap.replaceChildren(
+      el('div', { class: 'row between wrap', style: { marginBottom: '6px' } },
+        el('div', {},
+          el('b', {}, fmtSize(total)),
+          el('span', { class: 'hint' }, ` / 추정 한도 ≈5MB · ${pct.toFixed(1)}% 사용`)),
+        badge(level === 'red' ? '공간 부족 임박' : level === 'amber' ? '주의' : '여유', level)),
+      el('div', { class: 'progress', style: { marginBottom: '12px' } },
+        el('i', { style: { width: pct.toFixed(1) + '%', ...(barColor ? { background: barColor, boxShadow: 'none' } : {}) } })),
+      el('div', { class: 'tbl-wrap' },
+        el('table', { class: 'tbl' },
+          el('thead', {}, el('tr', {},
+            el('th', {}, '항목'), el('th', {}, '키'),
+            el('th', { style: { textAlign: 'right' } }, '크기'),
+            el('th', { style: { textAlign: 'right' } }, '비중'))),
+          el('tbody', {}, rows.map(r => el('tr', {},
+            el('td', {}, r.label),
+            el('td', { class: 'mono' }, r.key ? 'rbtl:' + r.key : '—'),
+            el('td', { class: 'mono', style: { textAlign: 'right' } }, fmtSize(r.bytes)),
+            el('td', { class: 'mono', style: { textAlign: 'right' } },
+              total > 0 ? ((r.bytes / total) * 100).toFixed(1) + '%' : '0%')))))));
+  }
+
+  const storageCard = el('div', { class: 'card' },
+    el('div', { class: 'panel-title' }, '저장 공간 사용량'),
+    el('p', { class: 'hint', style: { marginBottom: '12px' } },
+      '이 브라우저의 localStorage 사용량입니다. 추정 한도 ≈5MB는 브라우저·프로필에 따라 다를 수 있습니다. ' +
+      '공간이 부족하면 평가 결과 저장이 실패할 수 있습니다(실패 시 결과는 JSON 파일로 자동 백업 다운로드됩니다).'),
+    storageWrap,
+    el('div', { class: 'row wrap', style: { marginTop: '12px' } },
+      el('button', {
+        class: 'btn btn-amber', onclick: async () => {
+          const runs = store.get('runs');
+          const n = Array.isArray(runs) ? runs.length : 0;
+          if (!await confirmDialog(`평가 이력(runs) ${n}개만 모두 삭제합니다. MCP·전략·벤치마크·설정·계정은 유지됩니다. 계속할까요?`)) return;
+          store.set('runs', []);
+          toast('평가 이력(runs)이 비워졌습니다.', 'success');
+          renderStorageUsage();
+        },
+      }, '🧹 평가 이력(runs)만 비우기'),
+      el('button', { class: 'btn btn-ghost', onclick: renderStorageUsage }, '⟳ 사용량 새로고침')),
+    el('p', { class: 'hint', style: { marginTop: '10px' } },
+      '💡 벡터 인덱스·그래프 DB는 재구축 시 압축 저장됩니다(v2.5). 인덱스·그래프 용량이 크게 표시되면 오케스트레이션 화면에서 재구축하세요.'));
+
   /* ---------- 레이아웃 ---------- */
   const rows = [el('div', { class: 'grid cols-2' }, connCard, gatewayCard)];
   if (!serverMode) rows.push(el('div', { style: { marginTop: '16px' } }, accountCard));
   if (isServerAdmin) rows.push(el('div', { style: { marginTop: '16px' } }, adminCard));
   rows.push(el('div', { style: { marginTop: '16px' } }, dataCard));
+  rows.push(el('div', { style: { marginTop: '16px' } }, storageCard));
   container.replaceChildren(...rows);
 
+  renderStorageUsage();
   testConn();
   if (serverMode) testGwHealth();
 }

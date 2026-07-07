@@ -14,7 +14,9 @@
 //   'rrf'(Reciprocal Rank Fusion, rrfK 기본 60). retrieveMulti(부질의 라운드로빈 병합) 신설.
 //
 // 저장 형태(store 'catalogIndex'):
-//  { builtAt, embedModel, dim, docs: [{ serverId, toolName, text, vec(소수4자리) }], docFields, mcpsFingerprint }
+//  { builtAt, embedModel, dim, docs: [{ serverId, toolName, text, vec }], docFields, mcpsFingerprint }
+//  - vec(v2.5 §I1): { q: base64(Int8Array), s: scale } Int8 양자화 저장 — 구 float 배열(소수 4자리)
+//    대비 ~1/5 크기. 구 포맷 인덱스도 docVec()이 그대로 디코드하므로 재구축 전까지 하위호환 동작.
 //
 // 검색 결과(retrieve 반환):
 //  { results: [{ serverId, toolName, score, source }], usedMethod, requestedMethod,
@@ -236,7 +238,7 @@ function ranksDesc(vals) {
  * 관련도만으로 평가되므로, 벡터가 전혀 없으면 결과는 관련도 순서와 동일해진다(회귀 안전).
  * 탐욕 선택 특성상 선택 순서가 곧 score 내림차순이다.
  * @param {Array<{serverId,toolName,score}>} cands 관련도(score) 내림차순 후보
- * @param {Map<string, number[]>} vecByKey 'serverId/toolName' → 벡터
+ * @param {Map<string, Float32Array|null>} vecByKey 'serverId/toolName' → docVec()으로 디코드된 벡터
  * @param {number} lambda 0~1 (1=관련도만, 0=다양성 최대)
  * @param {number} k 선택 개수
  * @returns {Array<{serverId,toolName,score}>} MMR score로 재정렬된 상위 k
@@ -267,6 +269,74 @@ function mmrRerank(cands, vecByKey, lambda, k) {
     selected.push({ serverId: chosen.serverId, toolName: chosen.toolName, vec: chosen.vec, score: bestScore });
   }
   return selected.map(s => ({ serverId: s.serverId, toolName: s.toolName, score: s.score }));
+}
+
+/* ============================================================
+   벡터 양자화(Int8 + base64) · 디코드 — v2.5(§I1)
+   ============================================================ */
+
+/** Int8Array → base64. 브라우저 btoa · node(≥16 전역 btoa) 공통 동작. */
+function int8ToB64(int8) {
+  const u8 = new Uint8Array(int8.buffer, int8.byteOffset, int8.length);
+  let bin = '';
+  const CHUNK = 0x8000; // String.fromCharCode 인자 수(호출 스택) 한도 방어
+  for (let i = 0; i < u8.length; i += CHUNK) bin += String.fromCharCode(...u8.subarray(i, i + CHUNK));
+  return btoa(bin);
+}
+
+/** base64 → Int8Array. 브라우저 atob · node(≥16 전역 atob) 공통 동작. */
+function b64ToInt8(b64) {
+  const bin = atob(String(b64 || ''));
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Int8Array(u8.buffer, 0, u8.length);
+}
+
+/**
+ * float 벡터 → Int8 양자화 저장 포맷 { q: base64(Int8Array), s: scale } (§I1).
+ * s = max(|v_i|)/127 (전부 0이면 s=0, q 전부 0), q_i = clamp(round(v_i/s), -127, 127).
+ * 복원값은 q_i·s — docVec()이 디코드한다. 구 float 배열(소수 4자리) 대비 저장량 ~1/5.
+ */
+function quantizeVec(v) {
+  const n = v.length;
+  const q = new Int8Array(n);
+  let maxAbs = 0;
+  for (let i = 0; i < n; i++) { const a = Math.abs(v[i]); if (a > maxAbs) maxAbs = a; }
+  const s = maxAbs / 127;
+  if (s > 0) {
+    for (let i = 0; i < n; i++) q[i] = Math.max(-127, Math.min(127, Math.round(v[i] / s)));
+  }
+  return { q: int8ToB64(q), s };
+}
+
+// 디코드 결과 캐시 — 같은 vec 객체(한 번의 store.get으로 얻은 인덱스의 문서)를 여러 소비 지점
+// (vectorScores → MMR vecByKey, catalogGraph의 semantic kNN 등)이 반복 디코드하지 않게 한다.
+// WeakMap이라 인덱스 객체가 버려지면 캐시 항목도 함께 회수된다.
+const DOC_VEC_CACHE = new WeakMap();
+
+/**
+ * 인덱스 문서 벡터 디코드 헬퍼(§I1) — catalogIndex/catalogGraph의 모든 doc.vec 소비 지점이 경유한다.
+ * @param {number[]|{q:string,s:number}|null|undefined} vecLike
+ *   구 포맷(float 배열) | 신 포맷({q: base64(Int8Array), s: scale}) | 없음.
+ * @returns {Float32Array|null} 디코드된 벡터. 빈 벡터·미지원 형태는 null(소비측은 길이 0과 동일 취급).
+ */
+export function docVec(vecLike) {
+  if (!vecLike || typeof vecLike !== 'object') return null;
+  const hit = DOC_VEC_CACHE.get(vecLike);
+  if (hit !== undefined) return hit;
+  let out = null;
+  if (Array.isArray(vecLike)) { // 구 포맷: float 배열
+    if (vecLike.length) out = Float32Array.from(vecLike);
+  } else if (typeof vecLike.q === 'string') { // 신 포맷: Int8 양자화(q=base64, s=scale)
+    const int8 = b64ToInt8(vecLike.q);
+    const s = Number(vecLike.s) || 0;
+    if (int8.length) {
+      out = new Float32Array(int8.length);
+      for (let i = 0; i < int8.length; i++) out[i] = int8[i] * s;
+    }
+  }
+  DOC_VEC_CACHE.set(vecLike, out);
+  return out;
 }
 
 /* ============================================================
@@ -303,7 +373,7 @@ export async function buildIndex({ mcps = [], embedModel = 'bge-m3:latest', docF
         serverId: t.serverId,
         toolName: t.toolName,
         text: t.text,
-        vec: v.map(x => Math.round(x * 1e4) / 1e4), // 소수 4자리 반올림
+        vec: quantizeVec(v), // §I1: Int8 양자화 {q,s} — 구 float 배열(소수 4자리) 대비 ~1/5 크기
       });
     });
     onProgress?.({ done: Math.min(i + EMBED_BATCH, total), total });
@@ -343,7 +413,7 @@ export function indexStatus(mcps = [], embedModel, docFields) {
     builtAt: idx.builtAt || null,
     docCount: idx.docs.length,
     embedModel: idx.embedModel || null,
-    dim: idx.dim || (idx.docs[0]?.vec?.length || 0),
+    dim: idx.dim || (docVec(idx.docs[0]?.vec)?.length || 0), // §I1: 구(배열)/신({q,s}) 포맷 공통
   };
 }
 
@@ -365,7 +435,8 @@ function vectorScores(qvec, idx, keyToIndex, currentTools) {
     const key = `${doc.serverId}/${doc.toolName}`;
     const ci = keyToIndex.get(key);
     if (ci === undefined) continue; // 삭제/개명된 도구는 제외
-    out.push({ serverId: doc.serverId, toolName: doc.toolName, i: ci, score: cosine(qvec, doc.vec || []) });
+    const v = docVec(doc.vec); // §I1: 구(배열)/신({q,s}) 포맷 공통 디코드
+    out.push({ serverId: doc.serverId, toolName: doc.toolName, i: ci, score: v ? cosine(qvec, v) : 0 });
   }
   return out;
 }
@@ -436,7 +507,7 @@ export async function retrieve(query, {
   // 콘텐츠 stale은 인덱스가 구축된 모델 기준으로 판정 — embedModel 불일치는 아래에서 별도 사유로 처리.
   // docFields는 현재 config값(미지정 시 인덱스 구축값)으로 비교해 문서 구성 변경 시 stale→키워드 폴백.
   const idxStale = idxExists && idx.mcpsFingerprint !== fingerprint(mcps, idx.embedModel, docFields !== undefined ? docFields : idx.docFields);
-  const idxDim = idxExists ? (idx.dim || idx.docs[0]?.vec?.length || 0) : 0;
+  const idxDim = idxExists ? (idx.dim || docVec(idx.docs[0]?.vec)?.length || 0) : 0; // §I1: 포맷 공통
 
   // vector/hybrid는 임베딩 인덱스를 요구 — 없음/stale/모델 불일치면 keyword로 폴백
   let usedMethod = (method === 'vector' || method === 'keyword' || method === 'hybrid') ? method : 'hybrid';
@@ -541,7 +612,7 @@ export async function retrieve(query, {
   let picked;
   if (lam < 1) {
     const vecByKey = idxExists
-      ? new Map((idx.docs || []).map(d => [`${d.serverId}/${d.toolName}`, d.vec || []]))
+      ? new Map((idx.docs || []).map(d => [`${d.serverId}/${d.toolName}`, docVec(d.vec)])) // §I1: 디코드 경유(캐시로 재디코드 없음)
       : new Map();
     picked = mmrRerank(filtered, vecByKey, lam, k);
   } else {
